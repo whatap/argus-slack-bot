@@ -15,6 +15,22 @@ interface ThreadState {
   lastTouchedAt: number;
 }
 
+/** 자른 history 의 첫 메시지가 orphan 인지.
+ *  user 메시지가 tool_result 만 들고 있으면 직전 assistant(tool_use) 가 사라진
+ *  상태 → 다음 turn 호출 시 Anthropic 이 400 (`unexpected tool_use_id` 에러).
+ *  Slack 봇은 thread history cap 으로 슬라이싱할 때 이 케이스가 잘 발생.
+ *  (assistant(tool_use) 가 첫 메시지인 경우는 다음 메시지에 tool_result 가
+ *  같이 있는 한 OK — Anthropic 이 받음.) */
+function isOrphanFirstMessage(m: MessageParam): boolean {
+  if (m.role !== "user") return false;
+  const content = m.content;
+  if (!Array.isArray(content)) return false;
+  if (content.length === 0) return false;
+  return content.every(
+    (b) => (b as { type?: string }).type === "tool_result",
+  );
+}
+
 export class ThreadHistory {
   private threads = new Map<string, ThreadState>();
 
@@ -46,6 +62,15 @@ export class ThreadHistory {
     const cap = this.maxTurns * 4;
     if (s.history.length > cap) {
       s.history = s.history.slice(s.history.length - cap);
+    }
+    // tool_use ↔ tool_result 페어 보호:
+    //   slice 시작점이 user(tool_result-only) 면 직전 assistant(tool_use) 가
+    //   사라져 orphan → Anthropic 이 400 거부. 그런 시작 메시지는 drop.
+    //   또한 첫 메시지가 assistant 면 — Anthropic 은 user 시작 강제 안 하지만
+    //   tool_use 만 있는 assistant 가 첫 메시지면 다음 turn 의 새 user 메시지가
+    //   바로 뒤에 오면 tool_use 미해결로 깨짐 → 같이 drop.
+    while (s.history.length > 0 && isOrphanFirstMessage(s.history[0])) {
+      s.history.shift();
     }
   }
 

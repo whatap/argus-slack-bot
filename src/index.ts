@@ -3,21 +3,32 @@
 // argus-slack-bot 진입점.
 // Slack Bolt App (Socket Mode) + Anthropic + whatap-mcp 셋 와이어링.
 //
-// 동작:
-//   1. 부팅 시 whatap-open-mcp-aitf 를 stdio 자식으로 spawn.
-//   2. Slack 의 app_mention / message.im 이벤트 받으면 ClaudeLoop 실행.
+// 동작 (multi-tenant):
+//   1. 부팅 시 SQLite (slack_user_id → WhaTap creds) 오픈.
+//   2. Slack 의 app_mention / message.im 이벤트 받으면:
+//      a. 텍스트가 명령 (register/cookie/whoami/logout/help) 이면 명령 처리.
+//      b. 일반 질의면 user 의 creds 룩업 → MCP per-request spawn → ClaudeLoop.
 //   3. 같은 thread 안의 후속 메시지는 ThreadHistory 로 컨텍스트 유지.
-//   4. SIGINT/SIGTERM 시 MCP child 정리 후 종료.
+//   4. SIGINT/SIGTERM 시 cleanup 후 종료.
 
-import "dotenv/config";
+// dotenv override:true — shell 에 같은 키가 빈 문자열로 박혀있으면 (예: 부모
+// 프로세스 에서 export ANTHROPIC_API_KEY=) dotenv 기본은 안 덮음. override 로
+// .env 의 값이 항상 이김. 운영 배포 시엔 systemd 환경변수가 우선이라야 한다면
+// 이 줄을 끄거나 ENV 분기 추가.
+import { config as dotenvConfig } from "dotenv";
+dotenvConfig({ override: true });
 
 import Anthropic from "@anthropic-ai/sdk";
 import bolt from "@slack/bolt";
 
-import { runClaudeWithMcp } from "./claude-loop.js";
+import { describeArgusSubTool } from "./argus-direct.js";
+import { runClaudeWithMcp, type ToolCallEntry } from "./claude-loop.js";
 import { ThreadHistory } from "./conversation.js";
+import { SqliteInstallationStore } from "./installations.js";
+import { landingPageHtml } from "./landing.js";
 import { WhatapMcpClient } from "./mcp-client.js";
 import { splitForSlack, toSlackMrkdwn } from "./slack-format.js";
+import { UserTokenStore, maskToken, type UserCreds } from "./user-tokens.js";
 
 const { App, LogLevel } = bolt;
 
@@ -31,19 +42,64 @@ function requireEnv(name: string): string {
   return v;
 }
 
-const SLACK_BOT_TOKEN = requireEnv("SLACK_BOT_TOKEN");
 const SLACK_APP_TOKEN = requireEnv("SLACK_APP_TOKEN");
 const ANTHROPIC_API_KEY = requireEnv("ANTHROPIC_API_KEY");
 const WHATAP_MCP_PATH = requireEnv("WHATAP_MCP_PATH");
+
+// Multi-workspace OAuth — 셋 다 있으면 multi-workspace 모드. 아니면 single-workspace
+// (SLACK_BOT_TOKEN 으로 폴백). 시연/내부용엔 single, 외부 배포엔 multi.
+const SLACK_CLIENT_ID = process.env.SLACK_CLIENT_ID || "";
+const SLACK_CLIENT_SECRET = process.env.SLACK_CLIENT_SECRET || "";
+const SLACK_SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET || "";
+const SLACK_STATE_SECRET = process.env.SLACK_STATE_SECRET || "";
+const SLACK_OAUTH_PORT = Number(process.env.SLACK_OAUTH_PORT || 3000);
+const IS_MULTI_WORKSPACE = !!(
+  SLACK_CLIENT_ID &&
+  SLACK_CLIENT_SECRET &&
+  SLACK_SIGNING_SECRET &&
+  SLACK_STATE_SECRET
+);
+
+// Single-workspace 폴백 토큰. multi-workspace 모드면 미사용.
+const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN || "";
+if (!IS_MULTI_WORKSPACE && !SLACK_BOT_TOKEN) {
+  console.error(
+    "[argus-slack-bot] Slack 인증 미설정.\n" +
+      "  • single-workspace: SLACK_BOT_TOKEN 필수\n" +
+      "  • multi-workspace : SLACK_CLIENT_ID + SLACK_CLIENT_SECRET + SLACK_SIGNING_SECRET + SLACK_STATE_SECRET",
+  );
+  process.exit(1);
+}
 
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-opus-4-7";
 const ANTHROPIC_MAX_TOKENS = Number(process.env.ANTHROPIC_MAX_TOKENS || 8192);
 const MAX_TOOL_HOPS = Number(process.env.MAX_TOOL_HOPS || 8);
 const MAX_HISTORY_TURNS = Number(process.env.MAX_HISTORY_TURNS || 10);
 
+// 토큰 DB 경로 — 기본 ./data/user_tokens.sqlite. WAL 모드.
+const USER_TOKENS_DB =
+  process.env.SLACK_USER_TOKENS_DB || "./data/user_tokens.sqlite";
+// Slack workspace 설치 DB. user_tokens 와 같은 sqlite 파일 공유 OK.
+const INSTALLATIONS_DB =
+  process.env.SLACK_INSTALLATIONS_DB || "./data/user_tokens.sqlite";
+
+// dev.whatap.io 가 default. customer 배포 시엔 api.whatap.io 로 가야 할 수도 있음.
+const DEFAULT_WHATAP_API_URL =
+  process.env.DEFAULT_WHATAP_API_URL || "https://dev.whatap.io";
+
+// argus 경로 (ask_whatap_expert) — 봇 운영 측이 들고있는 단일 인스턴스.
+// 사용자 cookie 가 있으면 cookie 경로, 없으면 token-only.
+const ARGUS_URL = process.env.ARGUS_URL || "";
+const ARGUS_API_TOKEN = process.env.ARGUS_API_TOKEN || "";
+
+// Default fallback creds — 사용자가 register 안 했을 때 대신 사용.
+// 시연/PoC 단계에 유용. 운영에선 사용자별 토큰이 정석. 빈 문자열이면 폴백 X (=
+// 미등록 사용자에게 register 안내). WHATAP_API_TOKEN / ARGUS_COOKIE env 는
+// 옛 single-workspace 봇 코드의 잔재이기도 한데, 다용도 재활용.
+const DEFAULT_WHATAP_API_TOKEN = process.env.WHATAP_API_TOKEN || "";
+const DEFAULT_ARGUS_COOKIE = process.env.ARGUS_COOKIE || "";
+
 // ── System prompt ────────────────────────────────────────────
-// argus 자체가 풍부한 system prompt 를 들고 있어서 bot 외곽 prompt 는 짧게.
-// Slack mrkdwn 가이드만 명시.
 const SYSTEM_PROMPT = `당신은 WhaTap 의 도메인 전문가 봇입니다. 사용자가 Slack 에서
 모니터링·알림·인프라에 대해 질문하면 ask_whatap_expert 도구로 argus (WhaTap 내부 LLM
 에이전트) 에 위임하고, 그 결과를 Slack 메시지로 답하세요.
@@ -52,55 +108,255 @@ const SYSTEM_PROMPT = `당신은 WhaTap 의 도메인 전문가 봇입니다. �
 - 답변에 표가 있으면 그대로 둠 (Slack 에선 코드블록으로 자동 변환됨).
 - 모호한 질문은 명확화 질문 1개를 우선 던져도 됨.
 - argus 가 이미 합성한 답을 받으면 그대로 사용자에게 전달 — 재요약·재해석 금지.
-- 도구 호출은 보통 ask_whatap_expert 한 번이면 충분. 특정 메트릭만 필요하면
-  whatap_query_data / whatap_recent_alerts 등 직접 호출 가능.`;
+
+**도구 선택 규칙 (중요):**
+- 사용자 자연어 질문은 **default 로 ask_whatap_expert 한 번** 호출. argus 가
+  내부 풀 카탈로그 (도구 40+, screen 카탈로그) 로 알맞은 sub-tool 자동 선택.
+- "알림 / 발생 / 등록된 룰 / 전력 / 사용량 / 메트릭 보여줘" 같은 도메인 질문은
+  ask_whatap_expert 가 정답. whatap_recent_alerts 등 단일 도구로는 데이터 부족.
+- whatap_query_data / whatap_recent_alerts / whatap_list_projects 같은 MCP 도구
+  직접 호출은 사용자가 **단일 메트릭 / 단일 pcode / 단일 파라미터** 를 명시적
+  으로 지정한 좁은 케이스만.
+- 의심스러우면 ask_whatap_expert 부터. 그게 실패 / 무관한 답을 줄 때만 직접 도구 fallback.
+- whatap_bulk_create_event_rule / whatap_bulk_create_flex_event 같은 알림 등록
+  도구는 ask_whatap_expert 안에서 argus 가 호출 — 봇이 직접 호출 X.`;
+
+// ── 명령 파싱 ────────────────────────────────────────────────
+interface ParsedCommand {
+  kind: "register" | "cookie" | "whoami" | "logout" | "help";
+  value?: string;
+}
+
+function parseCommand(text: string): ParsedCommand | null {
+  const trimmed = text.trim();
+  // 첫 단어 + rest. command 는 case-insensitive.
+  const firstSpace = trimmed.search(/\s/);
+  const head =
+    firstSpace < 0 ? trimmed.toLowerCase() : trimmed.slice(0, firstSpace).toLowerCase();
+  const rest = firstSpace < 0 ? "" : trimmed.slice(firstSpace + 1).trim();
+  switch (head) {
+    case "register":
+      return { kind: "register", value: rest };
+    case "cookie":
+      return { kind: "cookie", value: rest };
+    case "whoami":
+      return { kind: "whoami" };
+    case "logout":
+      return { kind: "logout" };
+    case "help":
+    case "도움말":
+      return { kind: "help" };
+  }
+  return null;
+}
+
+const HELP_MESSAGE = [
+  "*argus 봇 사용법*",
+  "",
+  "*등록 (DM 으로만 보내세요 — 채널 노출 금지):*",
+  "• `register <whatap-api-token>` — WhaTap Console 에서 발급받은 토큰 등록",
+  "• `cookie <argus-session-cookie>` — (옵션) `JSESSIONID=...` 전체 cookie 헤더값. ask_whatap_expert 깊은 답변 활성",
+  "",
+  "*상태 확인 / 해제:*",
+  "• `whoami` — 등록된 토큰/cookie 마스킹 표시",
+  "• `logout` — 등록된 creds 삭제",
+  "",
+  "*질의:*",
+  "• 채널에서 `@argus <질문>` 또는 DM 으로 자유 형식",
+  "",
+  "토큰 발급: WhaTap Console → 계정 설정 → API Token",
+].join("\n");
 
 // ── 부팅 ──────────────────────────────────────────────────────
 async function main() {
-  // 1) MCP 자식 띄움
-  console.log("[argus-slack-bot] starting MCP client (whatap-mcp)...");
-  const mcpClient = new WhatapMcpClient({ scriptPath: WHATAP_MCP_PATH });
-  await mcpClient.connect();
-  const toolNames = mcpClient.toolsForAnthropic().map((t) => t.name);
-  console.log(`[argus-slack-bot] MCP tools loaded (${toolNames.length}): ${toolNames.join(", ")}`);
+  console.log("[argus-slack-bot] starting...");
 
-  // 2) Anthropic + 대화 history
+  // 1) 토큰 저장소 (사용자 WhaTap creds + Slack workspace 설치 둘 다)
+  const tokenStore = new UserTokenStore(USER_TOKENS_DB);
+  const installationStore = IS_MULTI_WORKSPACE
+    ? new SqliteInstallationStore(INSTALLATIONS_DB)
+    : null;
+  console.log(`[argus-slack-bot] token DB: ${USER_TOKENS_DB}`);
+  if (installationStore) {
+    console.log(
+      `[argus-slack-bot] mode=multi-workspace installations=${installationStore.count()} oauth-port=${SLACK_OAUTH_PORT}`,
+    );
+  } else {
+    console.log("[argus-slack-bot] mode=single-workspace (SLACK_BOT_TOKEN)");
+  }
+
+  // 2) Anthropic + thread history
   const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
   const threadHistory = new ThreadHistory(MAX_HISTORY_TURNS);
 
-  // 3) Slack Bolt App (Socket Mode)
-  const app = new App({
-    token: SLACK_BOT_TOKEN,
-    appToken: SLACK_APP_TOKEN,
-    socketMode: true,
-    logLevel: LogLevel.INFO,
-  });
+  // 3) Slack Bolt App
+  // - single-workspace: token 직접 주입
+  // - multi-workspace: installationStore + clientId/secret/signingSecret/stateSecret
+  //   Bolt 가 OAuth 콜백용 HTTP server 도 같이 띄움 (port=SLACK_OAUTH_PORT).
+  //   Socket Mode 는 그대로 — appToken 으로 모든 워크스페이스 이벤트 수신, 응답 시
+  //   installationStore 로 해당 team_id 의 bot_token 을 자동 lookup.
+  const SLACK_SCOPES = [
+    "app_mentions:read",
+    "chat:write",
+    "im:history",
+    "im:read",
+    "im:write",
+  ];
+  const app = IS_MULTI_WORKSPACE
+    ? new App({
+        appToken: SLACK_APP_TOKEN,
+        socketMode: true,
+        clientId: SLACK_CLIENT_ID,
+        clientSecret: SLACK_CLIENT_SECRET,
+        signingSecret: SLACK_SIGNING_SECRET,
+        stateSecret: SLACK_STATE_SECRET,
+        scopes: SLACK_SCOPES,
+        installationStore: installationStore!,
+        installerOptions: {
+          port: SLACK_OAUTH_PORT,
+          // 기본 path: /slack/install (시작), /slack/oauth_redirect (콜백)
+        },
+        // root 에 마케팅 랜딩 페이지 — QR / 데모용
+        customRoutes: [
+          {
+            path: "/",
+            method: ["GET"],
+            handler: (_req, res) => {
+              res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+              res.end(landingPageHtml());
+            },
+          },
+        ],
+        logLevel: LogLevel.INFO,
+      })
+    : new App({
+        token: SLACK_BOT_TOKEN,
+        appToken: SLACK_APP_TOKEN,
+        socketMode: true,
+        logLevel: LogLevel.INFO,
+      });
 
-  // 메시지 핸들러 — app_mention / DM 둘 다 처리.
-  // Bolt 가 app_mention 과 message.im 을 각각 트리거하지만 처리 로직은 동일.
+  // 메시지 핸들러 — app_mention / DM 둘 다.
+  // client = event 컨텍스트의 워크스페이스별 WebClient (multi-workspace 에선
+  // bot_token 이 워크스페이스 마다 다르므로 app.client 가 아니라 이걸 써야 함).
   const handle = async (params: {
     text: string;
+    userId: string;
+    isDm: boolean;
     threadKey: string;
-    say: (args: { text: string; thread_ts?: string }) => Promise<unknown>;
+    say: (args: { text: string; thread_ts?: string; blocks?: unknown[] }) => Promise<unknown>;
+    /** Bolt 가 event listener 한테 주는 워크스페이스별 WebClient.
+     *  타입은 bolt 가 re-export 안 해서 minimal 인터페이스로 inline. */
+    client: {
+      chat: {
+        update: (args: {
+          channel: string;
+          ts: string;
+          text: string;
+          blocks?: unknown[];
+        }) => Promise<unknown>;
+      };
+    };
     threadTs: string;
   }) => {
-    const { text, threadKey, say, threadTs } = params;
+    const { text, userId, isDm, threadKey, say, client, threadTs } = params;
     if (!text) return;
 
-    // 로딩 표시 (Slack 은 typing indicator 를 사용자 봇은 못 띄움 — placeholder 메시지로 대체)
+    // ── 명령 처리 (register/cookie/whoami/logout/help) ─────
+    const cmd = parseCommand(text);
+    if (cmd) {
+      await handleCommand(cmd, {
+        userId,
+        isDm,
+        threadTs,
+        say,
+        tokenStore,
+      });
+      return;
+    }
+
+    // ── 사용자 creds 룩업 (없으면 default 폴백) ─────────────
+    let creds = tokenStore.get(userId);
+    let usingDefault = false;
+    if (!creds && DEFAULT_WHATAP_API_TOKEN) {
+      creds = {
+        whatapApiToken: DEFAULT_WHATAP_API_TOKEN,
+        argusCookie: DEFAULT_ARGUS_COOKIE || undefined,
+      };
+      usingDefault = true;
+      console.log(`[argus-slack-bot] user=${userId} using default creds`);
+    }
+    if (!creds) {
+      await say({
+        text:
+          ":lock: 등록된 토큰이 없어요. DM 으로 `register <whatap-api-token>` 보내주세요.\n" +
+          "사용법: `help`",
+        thread_ts: threadTs,
+      });
+      return;
+    }
+    void usingDefault; // 향후 응답 끝에 "데모 토큰 사용 중" 안내 hint 시 사용
+
+    // ── 로딩 placeholder ────────────────────────────────────
     let placeholderTs: string | undefined;
     try {
-      const placed = (await say({ text: "_argus 가 응답 준비 중..._", thread_ts: threadTs })) as
-        | { ts?: string }
-        | undefined;
+      const placed = (await say({
+        text: "_argus 가 응답 준비 중..._",
+        thread_ts: threadTs,
+      })) as { ts?: string } | undefined;
       placeholderTs = placed?.ts;
     } catch {
       // placeholder 실패해도 본 응답은 시도.
     }
 
+    // ── per-request MCP spawn ───────────────────────────────
+    const mcpEnv = buildMcpEnv(creds);
+    const mcpClient = new WhatapMcpClient({
+      scriptPath: WHATAP_MCP_PATH,
+      env: mcpEnv,
+    });
+
     try {
+      await mcpClient.connect();
+
       const state = threadHistory.get(threadKey);
       const t0 = Date.now();
+
+      // ── 스트리밍: 800ms throttle 로 placeholder 메시지 update ──────
+      // Slack rate limit 회피 + 너무 자주 갱신해서 깜빡이는 것 방지.
+      const STREAM_INTERVAL_MS = 800;
+      const channel = getChannelFromThreadKey(threadKey);
+      let lastUpdateAt = 0;
+      let lastSentText = "";
+      const flushUpdate = async (display: string) => {
+        if (!placeholderTs) return;
+        if (display === lastSentText) return;
+        lastSentText = display;
+        try {
+          await client.chat.update({
+            channel,
+            ts: placeholderTs,
+            text: display,
+          });
+        } catch (err) {
+          // 첫 실패만 로그 (반복 로그 노이즈 줄임)
+          const msg = err instanceof Error ? err.message : String(err);
+          console.warn(
+            `[argus-slack-bot] chat.update failed ts=${placeholderTs}: ${msg}`,
+          );
+        }
+      };
+
+      // argus 직접 호출 설정 — ask_whatap_expert 호출 시 MCP 우회.
+      const argusDirect =
+        ARGUS_URL && ARGUS_API_TOKEN
+          ? {
+              url: ARGUS_URL,
+              apiToken: ARGUS_API_TOKEN,
+              cookie: creds.argusCookie,
+            }
+          : undefined;
+
       const result = await runClaudeWithMcp(
         {
           anthropic,
@@ -109,45 +365,88 @@ async function main() {
           maxTokens: ANTHROPIC_MAX_TOKENS,
           maxHops: MAX_TOOL_HOPS,
           system: SYSTEM_PROMPT,
+          argusDirect,
+          onProgress: (snap) => {
+            const now = Date.now();
+            if (now - lastUpdateAt < STREAM_INTERVAL_MS) return;
+            lastUpdateAt = now;
+            const body = composeStreamingBody({
+              text: snap.text,
+              toolInProgress: snap.toolInProgress,
+              toolCallLog: snap.toolCallLog,
+            });
+            void flushUpdate(body);
+          },
         },
         text,
         state.history,
       );
       const dur = Date.now() - t0;
       console.log(
-        `[argus-slack-bot] thread=${threadKey} hops=${result.hops} dur=${dur}ms text_len=${result.text.length}`,
+        `[argus-slack-bot] user=${userId} thread=${threadKey} hops=${result.hops} dur=${dur}ms text_len=${result.text.length}`,
       );
 
       threadHistory.appendTurn(threadKey, result.newMessages);
 
-      const formatted = toSlackMrkdwn(result.text || "_(빈 응답)_");
+      const formattedText = toSlackMrkdwn(result.text || "_(빈 응답)_");
+      const toolFooter = renderToolFooter(result.toolCallLog);
+      const formatted = toolFooter
+        ? `${formattedText}\n\n${toolFooter}`
+        : formattedText;
       const chunks = splitForSlack(formatted);
 
-      // placeholder 가 있으면 첫 chunk 로 update, 아니면 새 메시지.
+      // chip actions (event-rule / flex-event 적용 / 취소) 가 있으면 마지막 chunk
+      // 에 Block Kit button 으로 동봉. 클릭 시 app.action(action_id) 핸들러가
+      // argus /v1/event-rules/apply 또는 /cancel 호출.
+      const chipBlocks = chipActionsToBlocks(result.chipActions, creds);
+      const lastIdx = chunks.length - 1;
+
       if (placeholderTs) {
         try {
-          await app.client.chat.update({
+          await client.chat.update({
             channel: getChannelFromThreadKey(threadKey),
             ts: placeholderTs,
             text: chunks[0],
+            blocks:
+              lastIdx === 0
+                ? withTextSection(chunks[0], chipBlocks)
+                : undefined,
           });
-        } catch {
-          await say({ text: chunks[0], thread_ts: threadTs });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.warn(
+            `[argus-slack-bot] final chat.update failed ts=${placeholderTs} text_len=${chunks[0].length}: ${msg}`,
+          );
+          await say({
+            text: chunks[0],
+            thread_ts: threadTs,
+            blocks: lastIdx === 0 ? withTextSection(chunks[0], chipBlocks) : undefined,
+          });
         }
       } else {
-        await say({ text: chunks[0], thread_ts: threadTs });
+        await say({
+          text: chunks[0],
+          thread_ts: threadTs,
+          blocks: lastIdx === 0 ? withTextSection(chunks[0], chipBlocks) : undefined,
+        });
       }
-      // 후속 chunk 는 추가 메시지로.
       for (let i = 1; i < chunks.length; i++) {
-        await say({ text: chunks[i], thread_ts: threadTs });
+        await say({
+          text: chunks[i],
+          thread_ts: threadTs,
+          blocks: i === lastIdx ? withTextSection(chunks[i], chipBlocks) : undefined,
+        });
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[argus-slack-bot] error in thread=${threadKey}:`, err);
+      console.error(
+        `[argus-slack-bot] error user=${userId} thread=${threadKey}:`,
+        err,
+      );
       const errText = `:warning: argus 호출 실패: \`${msg}\``;
       if (placeholderTs) {
         try {
-          await app.client.chat.update({
+          await client.chat.update({
             channel: getChannelFromThreadKey(threadKey),
             ts: placeholderTs,
             text: errText,
@@ -158,28 +457,32 @@ async function main() {
       } else {
         await say({ text: errText, thread_ts: threadTs });
       }
+    } finally {
+      try {
+        await mcpClient.close();
+      } catch {}
     }
   };
 
-  app.event("app_mention", async ({ event, say }) => {
+  app.event("app_mention", async ({ event, say, client }) => {
     const channel = event.channel;
-    // 멘션은 기본적으로 thread_ts 가 부모 메시지라면 thread 안, 아니면 메시지 자체 ts.
     const threadTs = event.thread_ts ?? event.ts;
     const threadKey = `${channel}:${threadTs}`;
-    // <@U123> argus 멘션 토큰 자체를 prompt 에서 제거.
     const cleanText = event.text.replace(/<@[A-Z0-9]+>/g, "").trim();
     await handle({
       text: cleanText,
+      userId: event.user ?? "",
+      isDm: false,
       threadKey,
       threadTs,
-      say: (args) => say(args),
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      say: (args) => say(args as any),
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
     });
   });
 
-  app.message(async ({ message, say }) => {
-    // Bolt 의 message union 은 GenericMessage + BotMessage + ... 등 다수 형태.
-    // DM 만 처리 (channel_type === "im"). subtype 있는 (bot 자기 메시지·edit 등) 은 무시.
-    // 모든 union 분기에서 필드 접근하려고 record 캐스팅.
+  app.message(async ({ message, say, client }) => {
     const m = message as unknown as Record<string, unknown>;
     if (m.channel_type !== "im") return;
     if (m.subtype) return;
@@ -189,11 +492,145 @@ async function main() {
     const ts = String(m.ts ?? "");
     const threadTs = String(m.thread_ts ?? ts);
     const threadKey = `${channel}:${threadTs}`;
-    await handle({ text, threadKey, threadTs, say: (args) => say(args) });
+    await handle({
+      text,
+      userId: String(m.user ?? ""),
+      isDm: true,
+      threadKey,
+      threadTs,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      say: (args) => say(args as any),
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+    });
+  });
+
+  // chip apply/cancel 클릭 핸들러. action_id 가 `apply_event_rule:<token>` 또는
+  // `cancel_event_rule:<token>` 형태라 정규식으로 매치.
+  app.action(/^(apply|cancel)_event_rule:.+$/, async (ctx) => {
+    const { ack, body, client, action } = ctx;
+    await ack();
+
+    const userId = (body as { user?: { id?: string } }).user?.id || "";
+    const channel =
+      (body as { channel?: { id?: string } }).channel?.id ||
+      (body as { container?: { channel_id?: string } }).container?.channel_id ||
+      "";
+    const threadTs =
+      (body as { message?: { thread_ts?: string; ts?: string } }).message
+        ?.thread_ts ||
+      (body as { message?: { ts?: string } }).message?.ts ||
+      undefined;
+
+    const actionId = (action as { action_id?: string }).action_id || "";
+    const m = actionId.match(/^(apply|cancel)_event_rule:(.+)$/);
+    if (!m) return;
+    const op = m[1] as "apply" | "cancel";
+    const token = m[2];
+
+    if (!ARGUS_URL) {
+      await client.chat.postEphemeral({
+        channel,
+        user: userId,
+        text: `:warning: ARGUS_URL 미설정 — chip apply 호출 불가`,
+        thread_ts: threadTs,
+      });
+      return;
+    }
+
+    const creds = tokenStore.get(userId);
+    if (!creds || !creds.argusCookie) {
+      await client.chat.postEphemeral({
+        channel,
+        user: userId,
+        text: `:warning: argus cookie 미등록 — DM 으로 \`register\` 명령으로 cookie 등록 후 다시 시도`,
+        thread_ts: threadTs,
+      });
+      return;
+    }
+
+    const path = op === "apply" ? "/v1/event-rules/apply" : "/v1/event-rules/cancel";
+    let resp: Response;
+    try {
+      resp = await fetch(`${ARGUS_URL}${path}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Cookie: creds.argusCookie,
+          ...(ARGUS_API_TOKEN ? { "X-Argus-Token": ARGUS_API_TOKEN } : {}),
+        },
+        body: JSON.stringify({ confirmToken: token }),
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await client.chat.postMessage({
+        channel,
+        thread_ts: threadTs,
+        text: `:warning: argus ${op} 호출 실패: \`${msg}\``,
+      });
+      return;
+    }
+
+    let bodyJson: Record<string, unknown> = {};
+    try {
+      bodyJson = (await resp.json()) as Record<string, unknown>;
+    } catch {
+      bodyJson = {};
+    }
+
+    if (!resp.ok) {
+      const errMsg = (bodyJson["error"] as string) || `HTTP ${resp.status}`;
+      await client.chat.postMessage({
+        channel,
+        thread_ts: threadTs,
+        text: `:x: ${op} 실패: \`${errMsg}\``,
+      });
+      return;
+    }
+
+    if (op === "cancel") {
+      await client.chat.postMessage({
+        channel,
+        thread_ts: threadTs,
+        text: `:wastebasket: 적용 취소 완료`,
+      });
+      return;
+    }
+
+    // apply 결과 — ApplyResult 의 summary 로 짧게 보고.
+    const action2 = (bodyJson["action"] as string) || "";
+    const summary = (bodyJson["summary"] as Record<string, number>) || {};
+    const elapsed = (bodyJson["elapsedMs"] as number) || 0;
+    const succeeded = (bodyJson["succeeded"] as unknown[]) || [];
+    const failed = (bodyJson["failed"] as unknown[]) || [];
+    const verb =
+      action2 === "create" ? "생성" : action2 === "update" ? "수정" : action2 === "delete" ? "삭제" : "적용";
+    const succN = succeeded.length;
+    const failN = failed.length;
+    const skipN = (summary["skipped"] as number) || 0;
+    const parts = [`:white_check_mark: ${succN}개 ${verb}`];
+    if (skipN > 0) parts.push(`${skipN}개 skip`);
+    if (failN > 0) parts.push(`:x: ${failN}개 실패`);
+    parts.push(`(${(elapsed / 1000).toFixed(1)}s)`);
+    await client.chat.postMessage({
+      channel,
+      thread_ts: threadTs,
+      text: parts.join(" · "),
+    });
   });
 
   await app.start();
-  console.log("[argus-slack-bot] connected (Socket Mode). Mention me with @argus in any channel I'm invited to.");
+  if (IS_MULTI_WORKSPACE) {
+    console.log(
+      `[argus-slack-bot] OAuth installer at http://localhost:${SLACK_OAUTH_PORT}/slack/install`,
+    );
+    console.log(
+      "[argus-slack-bot] (외부 도달 가능한 redirect URL 을 Slack 앱 설정에 등록해야 OAuth 가 동작)",
+    );
+  }
+  console.log(
+    "[argus-slack-bot] connected (Socket Mode). DM me 'help' 또는 채널에서 @argus 멘션.",
+  );
 
   // 4) Graceful shutdown
   const shutdown = async (sig: string) => {
@@ -202,7 +639,10 @@ async function main() {
       await app.stop();
     } catch {}
     try {
-      await mcpClient.close();
+      tokenStore.close();
+    } catch {}
+    try {
+      installationStore?.close();
     } catch {}
     process.exit(0);
   };
@@ -210,10 +650,266 @@ async function main() {
   process.on("SIGTERM", () => shutdown("SIGTERM"));
 }
 
+/** UserCreds + 운영측 ARGUS_URL/TOKEN → MCP child env 빌드.
+ *  보안: 사용자가 cookie 미등록이면 빈 문자열로 명시 — 봇 process.env 의
+ *  운영자 cookie 가 자식에 inherit 되지 않게.
+ */
+function buildMcpEnv(creds: UserCreds): Record<string, string> {
+  const env: Record<string, string> = {
+    WHATAP_API_TOKEN: creds.whatapApiToken,
+    WHATAP_API_URL: creds.whatapApiUrl ?? DEFAULT_WHATAP_API_URL,
+    ARGUS_COOKIE: creds.argusCookie ?? "",
+  };
+  if (ARGUS_URL) env.ARGUS_URL = ARGUS_URL;
+  if (ARGUS_API_TOKEN) env.ARGUS_API_TOKEN = ARGUS_API_TOKEN;
+  return env;
+}
+
+async function handleCommand(
+  cmd: ParsedCommand,
+  ctx: {
+    userId: string;
+    isDm: boolean;
+    threadTs: string;
+    say: (args: { text: string; thread_ts?: string; blocks?: unknown[] }) => Promise<unknown>;
+    tokenStore: UserTokenStore;
+  },
+): Promise<void> {
+  const { userId, isDm, threadTs, say, tokenStore } = ctx;
+
+  switch (cmd.kind) {
+    case "help":
+      await say({ text: HELP_MESSAGE, thread_ts: threadTs });
+      return;
+
+    case "whoami": {
+      const c = tokenStore.get(userId);
+      if (!c) {
+        if (DEFAULT_WHATAP_API_TOKEN) {
+          await say({
+            text: [
+              ":robot_face: *데모 토큰으로 동작 중*",
+              `• whatap-api-token: \`${maskToken(DEFAULT_WHATAP_API_TOKEN)}\` (default 폴백)`,
+              `• argus-cookie: ${DEFAULT_ARGUS_COOKIE ? "`" + maskToken(DEFAULT_ARGUS_COOKIE) + "`" : "(없음)"}`,
+              "",
+              "자기 권한으로 사용하려면 `register <whatap-api-token>` 으로 등록.",
+            ].join("\n"),
+            thread_ts: threadTs,
+          });
+        } else {
+          await say({
+            text: ":no_entry_sign: 미등록 상태. `register <token>` 으로 등록하세요.",
+            thread_ts: threadTs,
+          });
+        }
+      } else {
+        await say({
+          text: [
+            ":bust_in_silhouette: *등록 상태*",
+            `• whatap-api-token: \`${maskToken(c.whatapApiToken)}\``,
+            `• argus-cookie: ${c.argusCookie ? "`" + maskToken(c.argusCookie) + "`" : "(없음)"}`,
+            `• whatap-api-url: \`${c.whatapApiUrl ?? "(default: " + DEFAULT_WHATAP_API_URL + ")"}\``,
+          ].join("\n"),
+          thread_ts: threadTs,
+        });
+      }
+      return;
+    }
+
+    case "logout": {
+      const removed = tokenStore.delete(userId);
+      await say({
+        text: removed
+          ? ":wave: 등록 정보 삭제됨. 다시 사용하려면 `register <token>`."
+          : ":no_entry_sign: 등록된 정보 없음.",
+        thread_ts: threadTs,
+      });
+      return;
+    }
+
+    case "register": {
+      if (!isDm) {
+        await say({
+          text:
+            ":warning: 보안상 `register` 는 DM 으로만 받습니다. " +
+            "@argus 멘션 말고 직접 DM 보내주세요.",
+          thread_ts: threadTs,
+        });
+        return;
+      }
+      const token = (cmd.value ?? "").trim();
+      if (!token) {
+        await say({
+          text: "사용법: `register <whatap-api-token>`",
+          thread_ts: threadTs,
+        });
+        return;
+      }
+      const existing = tokenStore.get(userId);
+      tokenStore.set(userId, {
+        whatapApiToken: token,
+        argusCookie: existing?.argusCookie,
+        whatapApiUrl: existing?.whatapApiUrl,
+      });
+      await say({
+        text: [
+          `:white_check_mark: 토큰 등록됨 (\`${maskToken(token)}\`).`,
+          existing?.argusCookie
+            ? "기존 cookie 유지."
+            : "더 깊은 답변(`ask_whatap_expert`) 원하면 `cookie <JSESSIONID=...>` 도 등록.",
+          "이제 `@argus <질문>` 또는 DM 으로 질의 가능.",
+        ].join("\n"),
+        thread_ts: threadTs,
+      });
+      return;
+    }
+
+    case "cookie": {
+      if (!isDm) {
+        await say({
+          text: ":warning: 보안상 `cookie` 는 DM 으로만 받습니다.",
+          thread_ts: threadTs,
+        });
+        return;
+      }
+      const cookie = (cmd.value ?? "").trim();
+      if (!cookie) {
+        await say({
+          text:
+            "사용법: `cookie JSESSIONID=...` (브라우저 dev tools → Application → Cookies 에서 복사)",
+          thread_ts: threadTs,
+        });
+        return;
+      }
+      const existing = tokenStore.get(userId);
+      if (!existing) {
+        await say({
+          text: ":no_entry_sign: 먼저 `register <token>` 으로 등록해주세요.",
+          thread_ts: threadTs,
+        });
+        return;
+      }
+      tokenStore.set(userId, {
+        ...existing,
+        argusCookie: cookie,
+      });
+      await say({
+        text: `:cookie: cookie 저장됨 (\`${maskToken(cookie)}\`). ask_whatap_expert 활성화.`,
+        thread_ts: threadTs,
+      });
+      return;
+    }
+  }
+}
+
 /** threadKey 는 "<channel>:<ts>" 포맷 — channel 추출. */
 function getChannelFromThreadKey(threadKey: string): string {
   const idx = threadKey.indexOf(":");
   return idx > 0 ? threadKey.slice(0, idx) : threadKey;
+}
+
+/** 도구 호출 기록 → 답변 끝에 붙일 단일 라인 footer (italic). */
+function renderToolFooter(log: ToolCallEntry[]): string {
+  if (log.length === 0) return "";
+  const items = log.map((t) => {
+    const sec = (t.durationMs / 1000).toFixed(1);
+    const mark = t.isError ? "❌ " : "";
+    return `${mark}\`${t.name}\` (${sec}s)`;
+  });
+  return `_🔧 호출 도구 (${log.length}): ${items.join(" · ")}_`;
+}
+
+/** 스트리밍 중 placeholder 메시지의 본문 합성.
+ *  텍스트 + 진행중 도구 indicator + 누적 도구 footer.
+ *  ask_whatap_expert 안이면 sub-tool 까지 표시.
+ */
+function composeStreamingBody(args: {
+  text: string;
+  toolInProgress?: { name: string; input?: unknown; subTool?: string };
+  toolCallLog: ToolCallEntry[];
+}): string {
+  const parts: string[] = [];
+  if (args.text) {
+    parts.push(toSlackMrkdwn(args.text));
+  } else {
+    parts.push("_argus 가 답변 중..._");
+  }
+  if (args.toolInProgress) {
+    if (args.toolInProgress.subTool) {
+      const subDesc = describeArgusSubTool(args.toolInProgress.subTool);
+      parts.push(
+        `_⏳ \`${args.toolInProgress.name}\` → ${subDesc} (\`${args.toolInProgress.subTool}\`)..._`,
+      );
+    } else {
+      parts.push(`_⏳ \`${args.toolInProgress.name}\` 호출 중..._`);
+    }
+  }
+  const footer = renderToolFooter(args.toolCallLog);
+  if (footer) parts.push(footer);
+  return parts.join("\n\n");
+}
+
+// ─────────────────────────────────────────────────────────────
+// chip → Slack Block Kit button 변환 + apply / cancel 핸들러
+// ─────────────────────────────────────────────────────────────
+
+import type { ChipAction } from "./claude-loop.js";
+
+// chipActionsToBlocks — argus 도구 응답에서 추출된 chip actions 를 Slack Block
+// Kit `actions` 블록(button row) 으로 변환. action_id 에 confirmToken 박아서
+// 클릭 시 추적 가능. action_id 길이 제한 255자라 token 자체가 길면 잘릴 수
+// 있는데, argus 의 `ct_<base64url 16bytes>` 는 22자라 안전.
+//
+// 같은 turn 에 여러 chip 쌍이 발급된 경우 (예: Critical + Warning 룰 두 번 등록)
+// 각 쌍이 별도 row 로 보임. 한 row 에 너무 많이 쏟으면 Slack UX 떨어짐.
+//
+// creds 는 클릭 시 argus 호출에 쓸 cookie / api token. action handler 가 user
+// id 로 다시 조회하므로 여기엔 박지 않음 — 보안상 button payload 에 cookie 넣지 X.
+function chipActionsToBlocks(actions: ChipAction[], _creds: UserCreds): unknown[] {
+  if (actions.length === 0) return [];
+
+  // apply / cancel 을 한 row 에 묶어 보기. 같은 confirmToken 끼리.
+  const byToken = new Map<string, ChipAction[]>();
+  for (const a of actions) {
+    const token = (a.payload?.["confirmToken"] as string) || "";
+    if (!token) continue;
+    const arr = byToken.get(token) || [];
+    arr.push(a);
+    byToken.set(token, arr);
+  }
+
+  const blocks: unknown[] = [];
+  for (const [token, group] of byToken) {
+    const elements = group.map((a) => {
+      const isApply = a.type === "applyEventRules" || a.type === "applyDashboard";
+      return {
+        type: "button",
+        text: {
+          type: "plain_text",
+          text: a.label.length > 75 ? a.label.slice(0, 72) + "..." : a.label,
+        },
+        // action_id 에 type prefix + token 박아서 핸들러가 분기.
+        action_id: `${isApply ? "apply" : "cancel"}_event_rule:${token}`,
+        style: isApply ? "primary" : undefined,
+        value: token,
+      };
+    });
+    blocks.push({ type: "actions", elements });
+  }
+  return blocks;
+}
+
+// withTextSection — text chunk 를 section block 으로 감싸고 chip blocks 를
+// 뒤에 붙임. blocks 가 비면 undefined 반환 (fallback to text-only).
+function withTextSection(text: string, chipBlocks: unknown[]): unknown[] | undefined {
+  if (chipBlocks.length === 0) return undefined;
+  // Slack section block text 는 3000자 제한. 그 이상이면 splitForSlack 가 이미
+  // 잘랐을 텐데 안전하게 한 번 더 truncate.
+  const safeText = text.length > 2900 ? text.slice(0, 2897) + "..." : text;
+  return [
+    { type: "section", text: { type: "mrkdwn", text: safeText } },
+    ...chipBlocks,
+  ];
 }
 
 main().catch((err) => {
