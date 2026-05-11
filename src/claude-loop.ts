@@ -96,6 +96,9 @@ export async function runClaudeWithMcp(
 ): Promise<RunResult> {
   const tools = cfg.mcpClient.toolsForAnthropic();
   const maxHops = cfg.maxHops ?? 8;
+  console.log(
+    `[claude-loop/debug] tools sent to anthropic: count=${tools.length} names=[${tools.map((t) => t.name).join(",")}]`,
+  );
 
   // 누적될 새 메시지들 — 사용자 메시지부터 시작.
   const newMessages: MessageParam[] = [

@@ -51,14 +51,28 @@ export class WhatapMcpClient {
     this.cachedTools = list.tools;
   }
 
-  /** Anthropic tool 스키마로 변환된 도구 목록 반환. */
+  /** Anthropic tool 스키마로 변환된 도구 목록 반환.
+   *
+   * **하네스 layer**: ask_whatap_expert 만 노출. 다른 MCP 직접 호출 도구
+   * (whatap_list_projects 등) 는 `api.whatap.io` 의 WHATAP_API_TOKEN 만료 시
+   * 400 ([F] Invalid token) 에러. ask_whatap_expert 는 argus /v1/chat 으로
+   * cookie 인증 → 토큰 무관. 8082 frontend 와 동일 흐름.
+   *
+   * 외곽 claude 가 도구 선택 자유도 갖되 ask_whatap_expert 한 개만 보임 →
+   * 자동으로 그것 호출 → argus 가 풀 카탈로그로 sub-tool 결정.
+   */
   toolsForAnthropic(): Array<{
     name: string;
     description: string;
     input_schema: { type: "object"; properties?: Record<string, unknown>; required?: string[] };
   }> {
     if (!this.cachedTools) throw new Error("MCP client not connected");
-    return this.cachedTools.map((t) => {
+    const ALLOWED = new Set(["ask_whatap_expert"]);
+    const filtered = this.cachedTools.filter((t) => ALLOWED.has(t.name));
+    console.log(
+      `[mcp-client/debug] toolsForAnthropic — cached=${this.cachedTools.length}, filtered=${filtered.length}, returning=[${filtered.map((t) => t.name).join(",")}]`,
+    );
+    return filtered.map((t) => {
       // MCP 의 inputSchema 는 JSON Schema 객체. Anthropic 은 type:"object" 만 허용.
       const raw = (t.inputSchema ?? {}) as {
         type?: string;

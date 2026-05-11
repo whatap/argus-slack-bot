@@ -48,21 +48,29 @@ export async function askWhatapExpertDirect(
   params: { query: string; pcode?: number; conversationId?: string },
   onProgress: (p: ArgusProgress) => void,
 ): Promise<AskWhatapExpertResult> {
-  const body: Record<string, unknown> = { query: params.query };
+  // /v1/chat (브라우저용, cookie 인증) 사용 — /v1/agent 의 X-Argus-Token
+  // 인증 layer 가 front.apm/nginx/ALB 어딘가에서 자체 검증되어 우회 어려움.
+  // 봇이 사용자 cookie 를 가지고 있으니 /v1/chat 으로 호출하면 토큰 무관.
+  // body field 는 ChatRequest 형식: query → message.
+  const body: Record<string, unknown> = { message: params.query };
   if (typeof params.pcode === "number") body.pcode = params.pcode;
   if (params.conversationId) body.conversationId = params.conversationId;
-  if (cfg.cookie) body.cookie = cfg.cookie;
-  body.context = { source: "argus-slack-bot" };
+  // /v1/chat 은 Cookie 헤더에서 직접 읽음 — body.cookie 안 씀.
+
+  // 디버그: query 와 routing 추적.
+  console.log(
+    `[argus-direct/debug] endpoint=/v1/chat query="${params.query.slice(0, 200)}" pcode=${params.pcode} conv=${params.conversationId || "-"} cookie_set=${!!cfg.cookie}`,
+  );
 
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
 
   let res: Response;
   try {
-    res = await fetch(`${cfg.url}/v1/agent`, {
+    res = await fetch(`${cfg.url}/v1/chat`, {
       method: "POST",
       headers: {
-        "X-Argus-Token": cfg.apiToken,
+        ...(cfg.cookie ? { Cookie: cfg.cookie } : {}),
         "Content-Type": "application/json",
         Accept: "text/event-stream",
       },
