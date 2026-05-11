@@ -19,6 +19,7 @@ import type {
 import {
   askWhatapExpertDirect,
   type ArgusDirectConfig,
+  type AskWhatapExpertResult,
 } from "./argus-direct.js";
 import type { WhatapMcpClient } from "./mcp-client.js";
 
@@ -186,6 +187,7 @@ export async function runClaudeWithMcp(
         const toolStart = Date.now();
         try {
           let result: string;
+          let directResult: AskWhatapExpertResult | null = null;
           if (tu.name === "ask_whatap_expert" && cfg.argusDirect) {
             // ask_whatap_expert 만 MCP 우회 — argus SSE 를 봇이 직접 받아
             // sub-tool 호출 (whatap_query_data, render_table 등) 을
@@ -195,37 +197,61 @@ export async function runClaudeWithMcp(
               pcode?: number;
               conversationId?: string;
             };
-            const r = await askWhatapExpertDirect(
-              cfg.argusDirect,
-              params,
-              (progress) => {
-                if (progress.subTool) {
-                  emit({
-                    name: tu.name,
-                    input: tu.input,
-                    subTool: progress.subTool,
-                  });
-                }
-              },
-            );
-            const lines: string[] = [r.text || "(argus 응답 없음)"];
-            if (r.recommendedQuestions && r.recommendedQuestions.length > 0) {
+            try {
+              directResult = await askWhatapExpertDirect(
+                cfg.argusDirect,
+                params,
+                (progress) => {
+                  if (progress.subTool) {
+                    emit({
+                      name: tu.name,
+                      input: tu.input,
+                      subTool: progress.subTool,
+                    });
+                  }
+                },
+              );
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              // 401/403 (cookie 만료/없음) → MCP fallback. MCP 의
+              // ask_whatap_expert 는 WHATAP_API_TOKEN 기반이라 cookie 와 무관 —
+              // 한쪽이 죽어도 다른 쪽 살아있음. 다른 에러 (5xx, 네트워크, JSON
+              // parse 실패) 는 그대로 throw → outer catch 가 tool_result.is_error
+              // 로 LLM 에 알림.
+              if (/\b40[13]\b/.test(msg)) {
+                console.warn(
+                  `[claude-loop] argusDirect 401/403 → MCP fallback: ${msg}`,
+                );
+                // directResult null 그대로 → 아래 else 분기에서 MCP 호출.
+              } else {
+                throw err;
+              }
+            }
+          }
+          if (directResult) {
+            const lines: string[] = [
+              directResult.text || "(argus 응답 없음)",
+            ];
+            if (
+              directResult.recommendedQuestions &&
+              directResult.recommendedQuestions.length > 0
+            ) {
               lines.push("", "**Suggested follow-ups:**");
-              for (const q of r.recommendedQuestions) {
+              for (const q of directResult.recommendedQuestions) {
                 lines.push(`- ${q}`);
               }
             }
-            if (r.conversationId) {
+            if (directResult.conversationId) {
               lines.push(
                 "",
-                `_conversationId: \`${r.conversationId}\`_`,
+                `_conversationId: \`${directResult.conversationId}\`_`,
               );
             }
             result = lines.join("\n");
             // argus 의 message_stop.actions (chip) 그대로 chipActions 에 누적.
             // 봇이 Slack Block Kit button 으로 변환해서 같이 전송.
-            if (r.actions && r.actions.length > 0) {
-              for (const a of r.actions) {
+            if (directResult.actions && directResult.actions.length > 0) {
+              for (const a of directResult.actions) {
                 chipActions.push(a);
               }
             }
