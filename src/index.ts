@@ -1025,6 +1025,9 @@ import type { ChipAction } from "./claude-loop.js";
 // 클릭 시 추적 가능. action_id 길이 제한 255자라 token 자체가 길면 잘릴 수
 // 있는데, argus 의 `ct_<base64url 16bytes>` 는 22자라 안전.
 //
+// 정식 contract (cross-repo): argus/internal/tools/CLAUDE.md
+// "Chip `actions[]` 발급 규약" 섹션. 새 chip type 추가 시 거기 체크리스트 따를 것.
+//
 // 지원 chip = event-rule / flex-event 의 apply/cancel 만. payload 에
 // confirmToken 있는 6 타입 (whatap_bulk_{create,update,delete}_event_rule +
 // 동일 flex_event 3종). 봇이 /v1/event-rules/{apply,cancel} 로 호출.

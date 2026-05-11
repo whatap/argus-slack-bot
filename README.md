@@ -98,14 +98,20 @@ DM 도 가능:
 ## 동작 디테일
 
 ### 대화 연속성
-- Slack thread 단위로 history 보관 (`ThreadHistory`, in-memory Map).
-- thread 안의 첫 호출에서 `ask_whatap_expert` 가 argus conversationId 발급 → 같은 thread 의 follow-up 마다 재사용.
-- 30분 idle 시 자동 expire (메모리 누수 방지). 봇 재기동 시 history 손실.
+- Slack thread 단위로 history 보관 (`ThreadHistory`, **SQLite 백킹** — 봇 재시작 후에도 thread 유지).
+- thread 안의 첫 호출에서 `ask_whatap_expert` 가 argus conversationId 발급 → `ThreadHistory.setArgusConvId` 로 저장 → 같은 thread 의 follow-up turn 의 `cfg.argusConversationId` 로 자동 주입 (argus 측 같은 conversation 으로 이어받음).
+- 30분 idle 시 자동 expire (메모리/디스크 누수 방지).
 
 ### 도구 호출 루프
 - Anthropic Messages API 의 manual tool_use loop. `claude-loop.ts` 참고.
-- 일반적으로 hop 1~3 (사용자 질문 → ask_whatap_expert → final text).
-- `MAX_TOOL_HOPS` (기본 8) 초과 시 강제 종료.
+- 일반적으로 hop 1~2 (사용자 질문 → ask_whatap_expert → final text). argus 가 자체 내부 maxHops=8 으로 도구 루프 돌려서 외곽은 짧게 끝남.
+- `MAX_TOOL_HOPS` (기본 3) 초과 시 강제 종료. 외곽 8 × 내부 8 = 최악 64 hop 비용 폭주 가드.
+- system + tools prefix 에 `cache_control={type:"ephemeral"}` — 5분 TTL prompt caching. hop≥2 부터 토큰 절감.
+
+### MCP keep-warm pool
+- 사용자별 `WhatapMcpClient` 풀 (`mcp-pool.ts`). 매 메시지마다 stdio child spawn 하던 0.5-1s 오버헤드 제거.
+- pool key = `slackUserId`. envHash (sha256 of sorted env) 로 cookie 갱신·register 자동 감지 → 옛 child close + new spawn.
+- idle 5분 lazy gc + 1분 interval gc.
 
 ### Slack 메시지 포맷 변환
 - argus 가 표준 Markdown 응답 → Slack mrkdwn 으로 변환 (`slack-format.ts`).
@@ -113,9 +119,27 @@ DM 도 가능:
 - 4000 자 초과 시 thread 안 여러 메시지로 분할.
 - `[text](url)` → `<url|text>`, `**bold**` → `*bold*`, `## 헤딩` → `*헤딩*`.
 
+### Chip actions (cross-repo contract)
+
+argus 가 도구 응답에 `actions: [{type, label, payload}]` 박으면 봇이 Slack Block Kit button 으로 변환. **payload 의 `confirmToken` 유무가 분기점** — 이 규약은 argus / argus-slack-bot / whatap-front 셋이 공유.
+
+- **`confirmToken` 있음** (`applyEventRules`, `cancelEventRules`) — 봇이 button 으로 표시. 클릭 시 `/v1/event-rules/{apply,cancel}` 호출. **cookie 필수** (`chat.CookieAuthMiddleware`) — cookie 미등록 사용자에겐 button 자체 안 보임 + 본문에 `cookie` 명령 안내.
+- **`confirmToken` 없음** (`applyDashboard`, `addWidgets`, `addFlexboardWidgets`) — 브라우저 navigate 용. 봇은 **silently skip**.
+
+정식 contract 와 새 chip type 추가 시 체크리스트:
+👉 **[argus/internal/tools/CLAUDE.md → Chip `actions[]` 발급 규약](../argus/internal/tools/CLAUDE.md)** (또는 사내 argus 리포 같은 경로)
+
+### 후속 질문 chip
+- argus 가 답변 시 `recommendedQuestions` 3개 발급 → 봇이 Block Kit button row 로 표시. 클릭 시 같은 thread 의 새 turn 으로 자동 전송 (`followup_question:<index>` action handler).
+
+### 에러 친절화
+- argus / WhaTap / 네트워크 / Anthropic / MCP 8 가지 패턴 매칭 → 사용자에게 복구 액션 명시 (`humanize.ts`).
+  예: argus 401 → "cookie 만료. DM 으로 `cookie <JSESSIONID=...>` 갱신".
+
 ### 보안
 - Slack Socket Mode → public URL 없이 동작 (서명 검증 SDK 자동).
 - secret 들은 `.env` 만 (gitignored). 운영 배포 시 secret manager 사용 권장.
+- **사용자 토큰 AES-256-GCM** — `SLACK_TOKENS_ENCRYPTION_KEY` env 설정 시 새 write 부터 암호화 (`enc:` prefix). 미설정이면 plaintext (legacy / dev). 점진 전환 — 마이그레이션 함수 X.
 
 ## 알려진 제약 / 후속
 
