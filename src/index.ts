@@ -27,7 +27,7 @@ import { ThreadHistory } from "./conversation.js";
 import { humanizeError } from "./humanize.js";
 import { SqliteInstallationStore } from "./installations.js";
 import { landingPageHtml } from "./landing.js";
-import { WhatapMcpClient } from "./mcp-client.js";
+import { McpClientPool } from "./mcp-pool.js";
 import { splitForSlack, toSlackMrkdwn } from "./slack-format.js";
 import { UserTokenStore, maskToken, type UserCreds } from "./user-tokens.js";
 
@@ -233,6 +233,11 @@ async function main() {
   );
   console.log(`[argus-slack-bot] thread history DB: ${THREAD_HISTORY_DB}`);
 
+  // MCP client 풀 — 사용자별 keep-warm child. 매 요청 spawn 오버헤드 (0.5-1s)
+  // 제거. 사용자 creds 변경 시 envHash 로 자동 재spawn.
+  const mcpPool = new McpClientPool(WHATAP_MCP_PATH);
+  console.log("[argus-slack-bot] mcp pool: keep-warm enabled (idle=5min)");
+
   // 3) Slack Bolt App
   // - single-workspace: token 직접 주입
   // - multi-workspace: installationStore + clientId/secret/signingSecret/stateSecret
@@ -353,16 +358,21 @@ async function main() {
       // placeholder 실패해도 본 응답은 시도.
     }
 
-    // ── per-request MCP spawn ───────────────────────────────
+    // ── MCP client 획득 (풀에서 keep-warm) ───────────────────
     const mcpEnv = buildMcpEnv(creds);
-    const mcpClient = new WhatapMcpClient({
-      scriptPath: WHATAP_MCP_PATH,
-      env: mcpEnv,
-    });
+    let mcpClient;
+    try {
+      mcpClient = await mcpPool.acquire(userId, mcpEnv);
+    } catch (err) {
+      console.error(`[argus-slack-bot] mcp acquire failed user=${userId}:`, err);
+      await say({
+        text: humanizeError(err),
+        thread_ts: threadTs,
+      });
+      return;
+    }
 
     try {
-      await mcpClient.connect();
-
       const state = threadHistory.get(threadKey);
       const t0 = Date.now();
 
@@ -516,9 +526,8 @@ async function main() {
         await say({ text: errText, thread_ts: threadTs });
       }
     } finally {
-      try {
-        await mcpClient.close();
-      } catch {}
+      // pool 정책: close 안 함. lastUsed 갱신만. 5분 idle 시 자동 evict.
+      mcpPool.release(userId);
     }
   };
 
@@ -752,6 +761,9 @@ async function main() {
     } catch {}
     try {
       threadHistory.close();
+    } catch {}
+    try {
+      await mcpPool.closeAll();
     } catch {}
     process.exit(0);
   };
