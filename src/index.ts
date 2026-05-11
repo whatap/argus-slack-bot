@@ -83,6 +83,9 @@ const MAX_HISTORY_TURNS = Number(process.env.MAX_HISTORY_TURNS || 10);
 // 토큰 DB 경로 — 기본 ./data/user_tokens.sqlite. WAL 모드.
 const USER_TOKENS_DB =
   process.env.SLACK_USER_TOKENS_DB || "./data/user_tokens.sqlite";
+// 사용자 토큰 암호화 키. 32+ bytes 권장 (`openssl rand -hex 32`).
+// 미설정이면 plaintext (legacy / dev). 설정 후 새 row 부터 암호화 — 마이그레이션 X.
+const TOKENS_ENCRYPTION_KEY = process.env.SLACK_TOKENS_ENCRYPTION_KEY || "";
 // Slack workspace 설치 DB. user_tokens 와 같은 sqlite 파일 공유 OK.
 const INSTALLATIONS_DB =
   process.env.SLACK_INSTALLATIONS_DB || "./data/user_tokens.sqlite";
@@ -201,11 +204,18 @@ async function main() {
   console.log("[argus-slack-bot] starting...");
 
   // 1) 토큰 저장소 (사용자 WhaTap creds + Slack workspace 설치 둘 다)
-  const tokenStore = new UserTokenStore(USER_TOKENS_DB);
+  const tokenStore = new UserTokenStore(
+    USER_TOKENS_DB,
+    TOKENS_ENCRYPTION_KEY || undefined,
+  );
   const installationStore = IS_MULTI_WORKSPACE
     ? new SqliteInstallationStore(INSTALLATIONS_DB)
     : null;
-  console.log(`[argus-slack-bot] token DB: ${USER_TOKENS_DB}`);
+  console.log(
+    `[argus-slack-bot] token DB: ${USER_TOKENS_DB} encryption: ${
+      tokenStore.isEncrypted() ? "enabled (AES-256-GCM)" : "DISABLED (plaintext)"
+    }`,
+  );
   if (installationStore) {
     console.log(
       `[argus-slack-bot] mode=multi-workspace installations=${installationStore.count()} oauth-port=${SLACK_OAUTH_PORT}`,

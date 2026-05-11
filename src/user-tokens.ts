@@ -3,12 +3,18 @@
 // Slack user_id → WhaTap 인증 매핑을 SQLite 에 저장.
 // MVP: WHATAP_API_TOKEN + ARGUS_COOKIE 두 키만. 향후 OAuth 로 옮기면 deprecate.
 //
-// 토큰은 plaintext 저장 — 노트북 / 단일 운영 호스트 전제. 다중 노드면
-// 서버 사이드 암호화 필요 (KMS / vault 등).
+// 암호화:
+//   - SLACK_TOKENS_ENCRYPTION_KEY env 가 있으면 AES-256-GCM 으로 token/cookie
+//     암호화 (envelope, 'enc:' prefix).
+//   - 미설정이면 plaintext (legacy / dev). DB 파일 평문 유출 위협 그대로.
+//   - 점진 전환: key 추가 후 새 write 부터 암호화. 기존 legacy plaintext row 도
+//     decryptToken 의 prefix 검사로 그대로 read.
 
 import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+
+import { decryptToken, deriveKey, encryptToken } from "./crypto.js";
 
 export interface UserCreds {
   whatapApiToken: string;
@@ -20,8 +26,10 @@ export interface UserCreds {
 
 export class UserTokenStore {
   private db: Database.Database;
+  /** 32-byte AES-256 key. null 이면 plaintext 모드 (legacy / dev). */
+  private encKey: Buffer | null;
 
-  constructor(dbPath: string) {
+  constructor(dbPath: string, encryptionSecret?: string) {
     mkdirSync(dirname(dbPath), { recursive: true });
     this.db = new Database(dbPath);
     this.db.pragma("journal_mode = WAL");
@@ -34,6 +42,20 @@ export class UserTokenStore {
         updated_at      INTEGER NOT NULL
       )
     `);
+    this.encKey = encryptionSecret ? deriveKey(encryptionSecret) : null;
+  }
+
+  /** 암호화 활성 상태. 부팅 로그용. */
+  isEncrypted(): boolean {
+    return this.encKey !== null;
+  }
+
+  private enc(v: string): string {
+    return this.encKey ? encryptToken(v, this.encKey) : v;
+  }
+
+  private dec(v: string): string {
+    return decryptToken(v, this.encKey);
   }
 
   set(slackUserId: string, creds: UserCreds): void {
@@ -49,8 +71,8 @@ export class UserTokenStore {
       )
       .run(
         slackUserId,
-        creds.whatapApiToken,
-        creds.argusCookie ?? null,
+        this.enc(creds.whatapApiToken),
+        creds.argusCookie ? this.enc(creds.argusCookie) : null,
         creds.whatapApiUrl ?? null,
         Date.now(),
       );
@@ -71,8 +93,8 @@ export class UserTokenStore {
       | undefined;
     if (!row) return null;
     return {
-      whatapApiToken: row.whatap_api_token,
-      argusCookie: row.argus_cookie ?? undefined,
+      whatapApiToken: this.dec(row.whatap_api_token),
+      argusCookie: row.argus_cookie ? this.dec(row.argus_cookie) : undefined,
       whatapApiUrl: row.whatap_api_url ?? undefined,
     };
   }
