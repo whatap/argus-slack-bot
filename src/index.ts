@@ -453,6 +453,11 @@ async function main() {
       // 에 Block Kit button 으로 동봉. 클릭 시 app.action(action_id) 핸들러가
       // argus /v1/event-rules/apply 또는 /cancel 호출.
       const chipBlocks = chipActionsToBlocks(result.chipActions, creds);
+      // 추천 후속 질문 → Block Kit button. 클릭 시 같은 thread 의 새 turn.
+      const followupBlocks = recommendedQuestionsToBlocks(
+        result.recommendedQuestions ?? [],
+      );
+      const extraBlocks = [...chipBlocks, ...followupBlocks];
       const lastIdx = chunks.length - 1;
 
       if (placeholderTs) {
@@ -463,7 +468,7 @@ async function main() {
             text: chunks[0],
             blocks:
               lastIdx === 0
-                ? withTextSection(chunks[0], chipBlocks)
+                ? withTextSection(chunks[0], extraBlocks)
                 : undefined,
           });
         } catch (err) {
@@ -474,21 +479,21 @@ async function main() {
           await say({
             text: chunks[0],
             thread_ts: threadTs,
-            blocks: lastIdx === 0 ? withTextSection(chunks[0], chipBlocks) : undefined,
+            blocks: lastIdx === 0 ? withTextSection(chunks[0], extraBlocks) : undefined,
           });
         }
       } else {
         await say({
           text: chunks[0],
           thread_ts: threadTs,
-          blocks: lastIdx === 0 ? withTextSection(chunks[0], chipBlocks) : undefined,
+          blocks: lastIdx === 0 ? withTextSection(chunks[0], extraBlocks) : undefined,
         });
       }
       for (let i = 1; i < chunks.length; i++) {
         await say({
           text: chunks[i],
           thread_ts: threadTs,
-          blocks: i === lastIdx ? withTextSection(chunks[i], chipBlocks) : undefined,
+          blocks: i === lastIdx ? withTextSection(chunks[i], extraBlocks) : undefined,
         });
       }
     } catch (err) {
@@ -668,6 +673,55 @@ async function main() {
       channel,
       thread_ts: threadTs,
       text: parts.join(" · "),
+    });
+  });
+
+  // 추천 후속 질문 chip 클릭 핸들러. action_id = `followup_question:<index>`,
+  // value = 질문 텍스트 (action_id 길이 제한 우회용 — 인덱스만 박고 value 에 텍스트).
+  // 클릭 시 같은 thread 의 새 turn 으로 handle() 재호출 — 사용자가 직접 입력한
+  // 것처럼 동작.
+  app.action(/^followup_question:.+$/, async (ctx) => {
+    const { ack, body, client, action } = ctx;
+    await ack();
+
+    const userId = (body as { user?: { id?: string } }).user?.id || "";
+    const channel =
+      (body as { channel?: { id?: string } }).channel?.id ||
+      (body as { container?: { channel_id?: string } }).container?.channel_id ||
+      "";
+    const message = (body as { message?: { thread_ts?: string; ts?: string } })
+      .message;
+    const threadTs = message?.thread_ts || message?.ts || "";
+    if (!channel || !threadTs || !userId) return;
+
+    const question = (action as { value?: string }).value || "";
+    if (!question) return;
+    const threadKey = `${channel}:${threadTs}`;
+
+    // 채널에 "<@user> selected: <질문>" 박아 다른 사람들도 맥락 유지.
+    await client.chat.postMessage({
+      channel,
+      thread_ts: threadTs,
+      text: `<@${userId}> _후속 질문 선택:_ ${question}`,
+    });
+
+    // handle() 재호출 — say 를 client.chat.postMessage 로 래핑.
+    await handle({
+      text: question,
+      userId,
+      isDm: false,
+      threadKey,
+      threadTs,
+      say: ((args: { text: string; thread_ts?: string; blocks?: unknown[] }) =>
+        client.chat.postMessage({
+          channel,
+          text: args.text,
+          thread_ts: args.thread_ts,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          blocks: args.blocks as any,
+        })) as Parameters<typeof handle>[0]["say"],
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
     });
   });
 
@@ -872,6 +926,33 @@ function renderToolFooter(log: ToolCallEntry[]): string {
     return `${mark}\`${t.name}\` (${sec}s)`;
   });
   return `_🔧 호출 도구 (${log.length}): ${items.join(" · ")}_`;
+}
+
+/** argus 가 발급한 추천 질문 (최대 5개) → Slack Block Kit button row.
+ *  답변 본문에는 안 넣고 (LLM hallucinate 방지) chip 으로만. 사용자가 클릭하면
+ *  app.action(`followup_question:.*`) 핸들러가 같은 thread 의 새 turn 으로 처리. */
+function recommendedQuestionsToBlocks(questions: string[]): unknown[] {
+  if (questions.length === 0) return [];
+  // Slack action 블록은 한 row 에 element 최대 25개. 라벨 75자 제한.
+  // argus 가 보통 3개라 충분.
+  const elements = questions.slice(0, 5).map((q, i) => ({
+    type: "button",
+    text: {
+      type: "plain_text",
+      text: q.length > 75 ? q.slice(0, 72) + "..." : q,
+    },
+    action_id: `followup_question:${i}`,
+    value: q,
+  }));
+  return [
+    {
+      type: "context",
+      elements: [
+        { type: "mrkdwn", text: ":sparkles: *추천 후속 질문 — 클릭하면 자동 전송:*" },
+      ],
+    },
+    { type: "actions", elements },
+  ];
 }
 
 /** cookie 미등록 사용자에게 적용 chip 발생 시 답변 본문에 추가할 안내.

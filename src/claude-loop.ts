@@ -92,6 +92,13 @@ export interface RunResult {
    * argus 측에서 같은 conversation 으로 이어받아 대화 컨텍스트 유지.
    */
   argusConversationId?: string;
+  /**
+   * argus 가 발급한 후속 질문 3개. 호출자(index.ts)가 Slack Block Kit button
+   * 으로 변환해 사용자가 클릭하면 같은 thread 의 새 turn 으로 처리.
+   * tool_result 텍스트에는 박지 않음 — LLM 이 답변에 한 번 더 박는 사고 +
+   * Slack 에서 클릭 불가 문제.
+   */
+  recommendedQuestions?: string[];
 }
 
 export interface ChipAction {
@@ -129,6 +136,8 @@ export async function runClaudeWithMcp(
   // 이번 turn 의 argusDirect 호출에서 받은 conversationId (마지막 값 유지).
   // RunResult 에 실어 호출자가 ThreadHistory 에 저장 → 다음 turn 자동 주입.
   let argusConversationIdOut: string | undefined;
+  // 이번 turn 의 추천 후속 질문 (마지막 ask_whatap_expert 호출 결과).
+  let recommendedQuestionsOut: string[] | undefined;
 
   const emit = (toolInProgress?: {
     name: string;
@@ -253,28 +262,24 @@ export async function runClaudeWithMcp(
             }
           }
           if (directResult) {
-            const lines: string[] = [
-              directResult.text || "(argus 응답 없음)",
-            ];
-            if (
-              directResult.recommendedQuestions &&
-              directResult.recommendedQuestions.length > 0
-            ) {
-              lines.push("", "**Suggested follow-ups:**");
-              for (const q of directResult.recommendedQuestions) {
-                lines.push(`- ${q}`);
-              }
-            }
-            // 봇이 자동으로 conversationId 를 다음 turn 에 주입하므로
-            // tool_result 본문에는 노출 X (LLM 이 hallucinate 해서 사용자 답변
-            // 에 박는 사고 방지). 디버그용 로그만.
+            // recommendedQuestions / conversationId 는 tool_result 텍스트에
+            // 박지 않고 RunResult 의 메타 필드로 호출자에게 전달. LLM 이
+            // hallucinate 해서 사용자 답변에 평문으로 박는 사고 방지 + 봇이
+            // 자동으로 다음 turn 에 주입 (conversationId) / chip 으로 변환
+            // (recommendedQuestions).
             if (directResult.conversationId) {
               argusConversationIdOut = directResult.conversationId;
               console.log(
                 `[claude-loop/debug] argus conversationId=${directResult.conversationId}`,
               );
             }
-            result = lines.join("\n");
+            if (
+              directResult.recommendedQuestions &&
+              directResult.recommendedQuestions.length > 0
+            ) {
+              recommendedQuestionsOut = directResult.recommendedQuestions;
+            }
+            result = directResult.text || "(argus 응답 없음)";
             // argus 의 message_stop.actions (chip) 그대로 chipActions 에 누적.
             // 봇이 Slack Block Kit button 으로 변환해서 같이 전송.
             if (directResult.actions && directResult.actions.length > 0) {
@@ -336,6 +341,9 @@ export async function runClaudeWithMcp(
     chipActions,
     ...(argusConversationIdOut
       ? { argusConversationId: argusConversationIdOut }
+      : {}),
+    ...(recommendedQuestionsOut && recommendedQuestionsOut.length > 0
+      ? { recommendedQuestions: recommendedQuestionsOut }
       : {}),
   };
 }
