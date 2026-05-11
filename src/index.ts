@@ -73,7 +73,10 @@ if (!IS_MULTI_WORKSPACE && !SLACK_BOT_TOKEN) {
 
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-opus-4-7";
 const ANTHROPIC_MAX_TOKENS = Number(process.env.ANTHROPIC_MAX_TOKENS || 8192);
-const MAX_TOOL_HOPS = Number(process.env.MAX_TOOL_HOPS || 8);
+// 외곽 hop 한계. argus 자체가 내부 maxHops=8 으로 도구 루프 돌리니, 외곽은
+// ask_whatap_expert 한 번이면 충분 (보통 hop 1~2). 외곽 8 + 내부 8 = 최악 64 hop
+// 비용 폭주 방지로 외곽은 3 으로 낮춤. env 로 override 가능.
+const MAX_TOOL_HOPS = Number(process.env.MAX_TOOL_HOPS || 3);
 const MAX_HISTORY_TURNS = Number(process.env.MAX_HISTORY_TURNS || 10);
 
 // 토큰 DB 경로 — 기본 ./data/user_tokens.sqlite. WAL 모드.

@@ -1,6 +1,6 @@
 // src/argus-direct.ts
 //
-// argus /v1/agent 직접 호출 — MCP 의 ask_whatap_expert 핸들러를 우회.
+// argus /v1/chat 직접 호출 — MCP 의 ask_whatap_expert 핸들러를 우회.
 // 우회하는 이유는 MCP 가 SSE 를 통째로 누적해서 결과만 주는 반면, 우리는
 // argus 안에서의 sub-tool 호출 (whatap_query_data, render_table 등) 을
 // 실시간으로 사용자에게 표시하고 싶기 때문.
@@ -86,12 +86,12 @@ export async function askWhatapExpertDirect(
     clearTimeout(timer);
     const errText = await res.text().catch(() => "");
     throw new Error(
-      `argus /v1/agent error (${res.status}): ${errText || res.statusText}`,
+      `argus /v1/chat error (${res.status}): ${errText || res.statusText}`,
     );
   }
   if (!res.body) {
     clearTimeout(timer);
-    throw new Error("argus /v1/agent returned no body");
+    throw new Error("argus /v1/chat returned no body");
   }
 
   try {

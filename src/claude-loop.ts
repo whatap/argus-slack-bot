@@ -49,7 +49,7 @@ export interface ClaudeLoopConfig {
   }) => void;
   /**
    * argus 직접 호출 설정. ask_whatap_expert tool 을 MCP 우회해서 봇이 직접
-   * argus /v1/agent SSE 받음 — sub-tool 호출을 onProgress 로 흘림.
+   * argus /v1/chat SSE 받음 — sub-tool 호출을 onProgress 로 흘림.
    * 미설정이면 MCP 의 ask_whatap_expert 그대로 사용 (backwards compat).
    */
   argusDirect?: ArgusDirectConfig;
