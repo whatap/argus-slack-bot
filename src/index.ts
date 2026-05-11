@@ -24,6 +24,7 @@ import bolt from "@slack/bolt";
 import { describeArgusSubTool } from "./argus-direct.js";
 import { runClaudeWithMcp, type ToolCallEntry } from "./claude-loop.js";
 import { ThreadHistory } from "./conversation.js";
+import { runDirectToArgus, type DirectRouteSnap } from "./direct-route.js";
 import { humanizeError } from "./humanize.js";
 import { SqliteInstallationStore } from "./installations.js";
 import { landingPageHtml } from "./landing.js";
@@ -353,95 +354,101 @@ async function main() {
       // placeholder 실패해도 본 응답은 시도.
     }
 
-    // ── MCP client 획득 (풀에서 keep-warm) ───────────────────
-    const mcpEnv = buildMcpEnv(creds);
-    let mcpClient;
-    try {
-      mcpClient = await mcpPool.acquire(userId, mcpEnv);
-    } catch (err) {
-      console.error(`[argus-slack-bot] mcp acquire failed user=${userId}:`, err);
-      await say({
-        text: humanizeError(err),
-        thread_ts: threadTs,
-      });
-      return;
-    }
+    // ── argusDirect 설정 — 정상 케이스의 진입점 ─────────────
+    // 봇 외곽 Claude tool_use loop 우회 (5-10초 절감, whatap-front 와 같은 흐름).
+    // 미설정 (ARGUS_URL/TOKEN 빈) 시에만 legacy MCP+claude-loop fallback.
+    const argusDirect =
+      ARGUS_URL && ARGUS_API_TOKEN
+        ? {
+            url: ARGUS_URL,
+            apiToken: ARGUS_API_TOKEN,
+            cookie: creds.argusCookie,
+          }
+        : undefined;
+
+    // ── 스트리밍 placeholder 업데이트 ──────────────────────────
+    // 800ms throttle — Slack rate limit 회피 + 깜빡임 방지.
+    const STREAM_INTERVAL_MS = 800;
+    const channel = getChannelFromThreadKey(threadKey);
+    let lastUpdateAt = 0;
+    let lastSentText = "";
+    const flushUpdate = async (display: string) => {
+      if (!placeholderTs) return;
+      if (display === lastSentText) return;
+      lastSentText = display;
+      try {
+        await client.chat.update({
+          channel,
+          ts: placeholderTs,
+          text: display,
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(
+          `[argus-slack-bot] chat.update failed ts=${placeholderTs}: ${msg}`,
+        );
+      }
+    };
+
+    // ── direct route (정상 경로) vs legacy MCP+claude-loop (폴백) ─
+    let result;
+    let mcpClient: Awaited<ReturnType<typeof mcpPool.acquire>> | null = null;
+    const t0 = Date.now();
+    const state = threadHistory.get(threadKey);
 
     try {
-      const state = threadHistory.get(threadKey);
-      const t0 = Date.now();
-
-      // ── 스트리밍: 800ms throttle 로 placeholder 메시지 update ──────
-      // Slack rate limit 회피 + 너무 자주 갱신해서 깜빡이는 것 방지.
-      const STREAM_INTERVAL_MS = 800;
-      const channel = getChannelFromThreadKey(threadKey);
-      let lastUpdateAt = 0;
-      let lastSentText = "";
-      const flushUpdate = async (display: string) => {
-        if (!placeholderTs) return;
-        if (display === lastSentText) return;
-        lastSentText = display;
-        try {
-          await client.chat.update({
-            channel,
-            ts: placeholderTs,
-            text: display,
-          });
-        } catch (err) {
-          // 첫 실패만 로그 (반복 로그 노이즈 줄임)
-          const msg = err instanceof Error ? err.message : String(err);
-          console.warn(
-            `[argus-slack-bot] chat.update failed ts=${placeholderTs}: ${msg}`,
-          );
-        }
-      };
-
-      // argus 직접 호출 설정 — ask_whatap_expert 호출 시 MCP 우회.
-      const argusDirect =
-        ARGUS_URL && ARGUS_API_TOKEN
-          ? {
-              url: ARGUS_URL,
-              apiToken: ARGUS_API_TOKEN,
-              cookie: creds.argusCookie,
-            }
-          : undefined;
-
-      const result = await runClaudeWithMcp(
-        {
-          anthropic,
-          mcpClient,
-          model: ANTHROPIC_MODEL,
-          maxTokens: ANTHROPIC_MAX_TOKENS,
-          maxHops: MAX_TOOL_HOPS,
-          system: SYSTEM_PROMPT,
-          argusDirect,
-          // 같은 thread 의 이전 turn 에서 argus 가 발급한 conversationId 주입.
-          // 첫 turn 이면 undefined → argus 가 새 conversation 생성.
-          argusConversationId: state.argusConversationId,
-          onProgress: (snap) => {
-            const now = Date.now();
-            if (now - lastUpdateAt < STREAM_INTERVAL_MS) return;
-            lastUpdateAt = now;
-            const body = composeStreamingBody({
-              text: snap.text,
-              toolInProgress: snap.toolInProgress,
-              toolCallLog: snap.toolCallLog,
-            });
-            void flushUpdate(body);
+      if (argusDirect) {
+        // 정상 경로: 봇 외곽 LLM 우회. argus /v1/chat SSE 직접 소비.
+        result = await runDirectToArgus(
+          {
+            argusDirect,
+            argusConversationId: state.argusConversationId,
+            onProgress: (snap) => {
+              const now = Date.now();
+              if (now - lastUpdateAt < STREAM_INTERVAL_MS) return;
+              lastUpdateAt = now;
+              void flushUpdate(composeStepStreamingBody(snap));
+            },
           },
-        },
-        text,
-        state.history,
-      );
+          text,
+        );
+      } else {
+        // legacy fallback: argusDirect 미설정 (배포 환경에서만 발생).
+        // MCP child 풀에서 acquire + 외곽 LLM tool_use loop.
+        const mcpEnv = buildMcpEnv(creds);
+        mcpClient = await mcpPool.acquire(userId, mcpEnv);
+        result = await runClaudeWithMcp(
+          {
+            anthropic,
+            mcpClient,
+            model: ANTHROPIC_MODEL,
+            maxTokens: ANTHROPIC_MAX_TOKENS,
+            maxHops: MAX_TOOL_HOPS,
+            system: SYSTEM_PROMPT,
+            argusConversationId: state.argusConversationId,
+            onProgress: (snap) => {
+              const now = Date.now();
+              if (now - lastUpdateAt < STREAM_INTERVAL_MS) return;
+              lastUpdateAt = now;
+              void flushUpdate(
+                composeStreamingBody({
+                  text: snap.text,
+                  toolInProgress: snap.toolInProgress,
+                  toolCallLog: snap.toolCallLog,
+                }),
+              );
+            },
+          },
+          text,
+          state.history,
+        );
+      }
       const dur = Date.now() - t0;
       console.log(
         `[argus-slack-bot] user=${userId} thread=${threadKey} hops=${result.hops} dur=${dur}ms text_len=${result.text.length}`,
       );
 
       threadHistory.appendTurn(threadKey, result.newMessages);
-      // argusDirect 가 새 conversationId 발급했으면 thread 에 저장 — 같은 thread
-      // 의 follow-up turn 에서 cfg.argusConversationId 로 다시 들어가 argus 측
-      // conversation 컨텍스트 유지. setArgusConvId 는 첫 호출만 set (이미 있으면 유지).
       if (result.argusConversationId) {
         threadHistory.setArgusConvId(threadKey, result.argusConversationId);
       }
@@ -521,8 +528,10 @@ async function main() {
         await say({ text: errText, thread_ts: threadTs });
       }
     } finally {
-      // pool 정책: close 안 함. lastUsed 갱신만. 5분 idle 시 자동 evict.
-      mcpPool.release(userId);
+      // legacy MCP fallback 경로만 release. direct route 는 mcpClient null.
+      if (mcpClient) {
+        mcpPool.release(userId);
+      }
     }
   };
 
@@ -959,6 +968,35 @@ function renderToolFooter(log: ToolCallEntry[]): string {
     return `${mark}\`${t.name}\` (${sec}s)`;
   });
   return `_🔧 호출 도구 (${log.length}): ${items.join(" · ")}_`;
+}
+
+/** direct route 의 step list + 누적 text → Slack placeholder mrkdwn.
+ *  whatap-front 의 step 가시화 흉내 — 봇 외곽 LLM 우회 시 사용자가 진행 상황
+ *  실시간 확인 가능. 각 sub-tool 마다 ☑/⏳ + dur 표기.
+ *
+ *  argus message_stop 받기 전엔 마지막 step 의 doneAt 이 undefined → "..." 표시. */
+function composeStepStreamingBody(snap: DirectRouteSnap): string {
+  const parts: string[] = [];
+  if (snap.steps.length === 0 && !snap.text) {
+    return "_argus 가 답변 준비 중..._";
+  }
+  if (snap.steps.length > 0) {
+    parts.push(":hourglass_flowing_sand: *argus 진행 중*");
+    for (const s of snap.steps) {
+      const desc = describeArgusSubTool(s.name);
+      const mark = s.doneAt ? ":white_check_mark:" : ":hourglass_flowing_sand:";
+      const dur = s.doneAt
+        ? ` · ${((s.doneAt - s.startedAt) / 1000).toFixed(1)}s`
+        : " · ...";
+      const labelSuffix = desc !== s.name ? ` (${desc})` : "";
+      parts.push(`${mark} \`${s.name}\`${labelSuffix}${dur}`);
+    }
+  }
+  if (snap.text) {
+    parts.push("");
+    parts.push(toSlackMrkdwn(snap.text));
+  }
+  return parts.join("\n");
 }
 
 /** argus 가 발급한 추천 질문 (최대 5개) → Slack Block Kit button row.
