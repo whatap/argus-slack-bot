@@ -54,6 +54,13 @@ export interface ClaudeLoopConfig {
    * 미설정이면 MCP 의 ask_whatap_expert 그대로 사용 (backwards compat).
    */
   argusDirect?: ArgusDirectConfig;
+  /**
+   * 같은 thread 의 이전 turn 에서 argus 가 발급한 conversationId.
+   * argusDirect 호출 시 LLM 이 input.conversationId 박지 않아도 봇이 자동으로
+   * 주입 → argus 측에서 같은 conversation 으로 이어 받음 (대화 컨텍스트 유지).
+   * LLM 이 input.conversationId 박은 경우 그게 우선 (수동 override 가능).
+   */
+  argusConversationId?: string;
 }
 
 export interface ToolCallEntry {
@@ -79,6 +86,12 @@ export interface RunResult {
    * 클릭 시 argus 의 /v1/event-rules/apply 또는 /cancel 호출.
    */
   chipActions: ChipAction[];
+  /**
+   * argusDirect 경로에서 받은 conversationId. 호출자가 ThreadHistory.setArgusConvId
+   * 로 thread 에 저장 → 다음 turn 의 cfg.argusConversationId 로 다시 들어감.
+   * argus 측에서 같은 conversation 으로 이어받아 대화 컨텍스트 유지.
+   */
+  argusConversationId?: string;
 }
 
 export interface ChipAction {
@@ -113,6 +126,9 @@ export async function runClaudeWithMcp(
   let finalText = "";
   const toolCallLog: ToolCallEntry[] = [];
   const chipActions: ChipAction[] = [];
+  // 이번 turn 의 argusDirect 호출에서 받은 conversationId (마지막 값 유지).
+  // RunResult 에 실어 호출자가 ThreadHistory 에 저장 → 다음 turn 자동 주입.
+  let argusConversationIdOut: string | undefined;
 
   const emit = (toolInProgress?: {
     name: string;
@@ -197,10 +213,18 @@ export async function runClaudeWithMcp(
               pcode?: number;
               conversationId?: string;
             };
+            // conversationId 우선순위:
+            //   1. LLM 이 명시적으로 input 에 박은 값 (수동 override)
+            //   2. 같은 thread 의 이전 turn 에서 받은 값 (cfg.argusConversationId)
+            //   3. 둘 다 없으면 argus 가 새 conversation 발급
+            const effectiveParams = {
+              ...params,
+              conversationId: params.conversationId ?? cfg.argusConversationId,
+            };
             try {
               directResult = await askWhatapExpertDirect(
                 cfg.argusDirect,
-                params,
+                effectiveParams,
                 (progress) => {
                   if (progress.subTool) {
                     emit({
@@ -241,10 +265,13 @@ export async function runClaudeWithMcp(
                 lines.push(`- ${q}`);
               }
             }
+            // 봇이 자동으로 conversationId 를 다음 turn 에 주입하므로
+            // tool_result 본문에는 노출 X (LLM 이 hallucinate 해서 사용자 답변
+            // 에 박는 사고 방지). 디버그용 로그만.
             if (directResult.conversationId) {
-              lines.push(
-                "",
-                `_conversationId: \`${directResult.conversationId}\`_`,
+              argusConversationIdOut = directResult.conversationId;
+              console.log(
+                `[claude-loop/debug] argus conversationId=${directResult.conversationId}`,
               );
             }
             result = lines.join("\n");
@@ -301,7 +328,16 @@ export async function runClaudeWithMcp(
     finalText = `(도구 호출 ${maxHops} hop 초과 — 응답 미완성)`;
   }
 
-  return { text: finalText, newMessages, hops, toolCallLog, chipActions };
+  return {
+    text: finalText,
+    newMessages,
+    hops,
+    toolCallLog,
+    chipActions,
+    ...(argusConversationIdOut
+      ? { argusConversationId: argusConversationIdOut }
+      : {}),
+  };
 }
 
 function extractText(content: ContentBlock[]): string {

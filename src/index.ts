@@ -399,6 +399,9 @@ async function main() {
           maxHops: MAX_TOOL_HOPS,
           system: SYSTEM_PROMPT,
           argusDirect,
+          // 같은 thread 의 이전 turn 에서 argus 가 발급한 conversationId 주입.
+          // 첫 turn 이면 undefined → argus 가 새 conversation 생성.
+          argusConversationId: state.argusConversationId,
           onProgress: (snap) => {
             const now = Date.now();
             if (now - lastUpdateAt < STREAM_INTERVAL_MS) return;
@@ -420,6 +423,12 @@ async function main() {
       );
 
       threadHistory.appendTurn(threadKey, result.newMessages);
+      // argusDirect 가 새 conversationId 발급했으면 thread 에 저장 — 같은 thread
+      // 의 follow-up turn 에서 cfg.argusConversationId 로 다시 들어가 argus 측
+      // conversation 컨텍스트 유지. setArgusConvId 는 첫 호출만 set (이미 있으면 유지).
+      if (result.argusConversationId) {
+        threadHistory.setArgusConvId(threadKey, result.argusConversationId);
+      }
 
       const formattedText = toSlackMrkdwn(result.text || "_(빈 응답)_");
       const toolFooter = renderToolFooter(result.toolCallLog);
