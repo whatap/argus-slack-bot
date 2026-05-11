@@ -432,9 +432,10 @@ async function main() {
 
       const formattedText = toSlackMrkdwn(result.text || "_(빈 응답)_");
       const toolFooter = renderToolFooter(result.toolCallLog);
-      const formatted = toolFooter
-        ? `${formattedText}\n\n${toolFooter}`
-        : formattedText;
+      const cookieHint = renderCookieGateHint(result.chipActions, creds);
+      const formatted = [formattedText, cookieHint, toolFooter]
+        .filter(Boolean)
+        .join("\n\n");
       const chunks = splitForSlack(formatted);
 
       // chip actions (event-rule / flex-event 적용 / 취소) 가 있으면 마지막 chunk
@@ -864,6 +865,23 @@ function renderToolFooter(log: ToolCallEntry[]): string {
   return `_🔧 호출 도구 (${log.length}): ${items.join(" · ")}_`;
 }
 
+/** cookie 미등록 사용자에게 적용 chip 발생 시 답변 본문에 추가할 안내.
+ *  chipActionsToBlocks 가 cookie 없으면 chip 자체를 표시 안 하므로 사용자가
+ *  "왜 적용 버튼이 없지?" 라고 헷갈리지 않게 명시. apply/cancel event-rule chip
+ *  이 한 개라도 있고 cookie 가 없을 때만 표시. */
+function renderCookieGateHint(actions: ChipAction[], creds: UserCreds): string {
+  if (creds.argusCookie) return "";
+  const hasApplyChips = actions.some(
+    (a) =>
+      a.type === "applyEventRules" || a.type === "cancelEventRules",
+  );
+  if (!hasApplyChips) return "";
+  return (
+    "_:lock: 적용 / 취소 버튼은 argus cookie 가 필요해 비활성됨. " +
+    "DM 으로 `cookie <JSESSIONID=...>` 등록 후 다시 질문하면 chip 활성화._"
+  );
+}
+
 /** 스트리밍 중 placeholder 메시지의 본문 합성.
  *  텍스트 + 진행중 도구 indicator + 누적 도구 footer.
  *  ask_whatap_expert 안이면 sub-tool 까지 표시.
@@ -905,28 +923,50 @@ import type { ChipAction } from "./claude-loop.js";
 // 클릭 시 추적 가능. action_id 길이 제한 255자라 token 자체가 길면 잘릴 수
 // 있는데, argus 의 `ct_<base64url 16bytes>` 는 22자라 안전.
 //
+// 지원 chip = event-rule / flex-event 의 apply/cancel 만. payload 에
+// confirmToken 있는 6 타입 (whatap_bulk_{create,update,delete}_event_rule +
+// 동일 flex_event 3종). 봇이 /v1/event-rules/{apply,cancel} 로 호출.
+//
+// 지원 X chip:
+//   - applyDashboard / addWidgets / addFlexboardWidgets — confirmToken 없음
+//     (widgets/dashboardPath payload). 브라우저 측 처리용 chip — 봇에선 silently
+//     skip 됨. 봇에 표시할 적용 endpoint 가 argus 측에 아직 없음.
+//
 // 같은 turn 에 여러 chip 쌍이 발급된 경우 (예: Critical + Warning 룰 두 번 등록)
 // 각 쌍이 별도 row 로 보임. 한 row 에 너무 많이 쏟으면 Slack UX 떨어짐.
 //
-// creds 는 클릭 시 argus 호출에 쓸 cookie / api token. action handler 가 user
-// id 로 다시 조회하므로 여기엔 박지 않음 — 보안상 button payload 에 cookie 넣지 X.
-function chipActionsToBlocks(actions: ChipAction[], _creds: UserCreds): unknown[] {
+// creds.argusCookie 없으면 chip 표시 자체를 안 함 — argus 의
+// /v1/event-rules/{apply,cancel} 핸들러가 chat.CookieAuthMiddleware 라 token
+// 만으론 401. chip 보여주고 클릭 후 거부하는 것보다 표시 안 하는 게 UX 일관성
+// ↑. 호출자가 "cookie 없음" 안내를 답변 본문에 추가 (renderCookieGateHint 참고).
+function chipActionsToBlocks(actions: ChipAction[], creds: UserCreds): unknown[] {
   if (actions.length === 0) return [];
+  if (!creds.argusCookie) return [];
 
   // apply / cancel 을 한 row 에 묶어 보기. 같은 confirmToken 끼리.
   const byToken = new Map<string, ChipAction[]>();
+  let droppedBrowserChips = 0;
   for (const a of actions) {
     const token = (a.payload?.["confirmToken"] as string) || "";
-    if (!token) continue;
+    if (!token) {
+      // 브라우저용 chip (applyDashboard / addWidgets / addFlexboardWidgets)
+      droppedBrowserChips++;
+      continue;
+    }
     const arr = byToken.get(token) || [];
     arr.push(a);
     byToken.set(token, arr);
+  }
+  if (droppedBrowserChips > 0) {
+    console.log(
+      `[argus-slack-bot] dropped ${droppedBrowserChips} browser-only chip(s) (dashboard / flexboard)`,
+    );
   }
 
   const blocks: unknown[] = [];
   for (const [token, group] of byToken) {
     const elements = group.map((a) => {
-      const isApply = a.type === "applyEventRules" || a.type === "applyDashboard";
+      const isApply = a.type === "applyEventRules";
       return {
         type: "button",
         text: {
