@@ -45,7 +45,16 @@ const REQUEST_TIMEOUT_MS = 120_000;
 
 export async function askWhatapExpertDirect(
   cfg: ArgusDirectConfig,
-  params: { query: string; pcode?: number; conversationId?: string },
+  params: {
+    query: string;
+    pcode?: number;
+    conversationId?: string;
+    /** 가짜 currentUrl — argus 의 screens.Lookup() 이 이 URL 로 화면 매칭 →
+     *  cpm.yaml 등의 domain_knowledge / analysis_guides / data_registry 가
+     *  system prompt 에 inject. whatap-front 패널이 자연스레 박는 효과를 봇이
+     *  사용자 메시지 텍스트 추론 (`screen-infer.ts`) 으로 흉내. */
+    currentUrl?: string;
+  },
   onProgress: (p: ArgusProgress) => void,
 ): Promise<AskWhatapExpertResult> {
   // /v1/chat (브라우저용, cookie 인증) 사용 — /v1/agent 의 X-Argus-Token
@@ -55,11 +64,14 @@ export async function askWhatapExpertDirect(
   const body: Record<string, unknown> = { message: params.query };
   if (typeof params.pcode === "number") body.pcode = params.pcode;
   if (params.conversationId) body.conversationId = params.conversationId;
+  if (params.currentUrl) {
+    body.context = { currentUrl: params.currentUrl };
+  }
   // /v1/chat 은 Cookie 헤더에서 직접 읽음 — body.cookie 안 씀.
 
   // 디버그: query 와 routing 추적.
   console.log(
-    `[argus-direct/debug] endpoint=/v1/chat query="${params.query.slice(0, 200)}" pcode=${params.pcode} conv=${params.conversationId || "-"} cookie_set=${!!cfg.cookie}`,
+    `[argus-direct/debug] endpoint=/v1/chat query="${params.query.slice(0, 200)}" pcode=${params.pcode} conv=${params.conversationId || "-"} url=${params.currentUrl || "-"} cookie_set=${!!cfg.cookie}`,
   );
 
   const ctrl = new AbortController();

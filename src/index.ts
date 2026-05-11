@@ -26,6 +26,7 @@ import { runClaudeWithMcp, type ToolCallEntry } from "./claude-loop.js";
 import { ThreadHistory } from "./conversation.js";
 import { runDirectToArgus, type DirectRouteSnap } from "./direct-route.js";
 import { humanizeError } from "./humanize.js";
+import { inferCurrentUrl } from "./screen-infer.js";
 import { SqliteInstallationStore } from "./installations.js";
 import { landingPageHtml } from "./landing.js";
 import { McpClientPool } from "./mcp-pool.js";
@@ -399,6 +400,15 @@ async function main() {
     try {
       if (argusDirect) {
         // 정상 경로: 봇 외곽 LLM 우회. argus /v1/chat SSE 직접 소비.
+        // 사용자 메시지에서 화면 의도 + pcode 추론 → 가짜 currentUrl 박음.
+        // argus 의 screens.Lookup() 이 매칭 → cpm.yaml 의 domain_knowledge /
+        // analysis_guides / data_registry inject. whatap-front 패널과 같은 효과.
+        const inferred = inferCurrentUrl(text);
+        if (inferred) {
+          console.log(
+            `[argus-slack-bot] screen inferred: ${inferred.currentUrl}`,
+          );
+        }
         result = await runDirectToArgus(
           {
             argusDirect,
@@ -411,6 +421,8 @@ async function main() {
             },
           },
           text,
+          inferred?.pcode,
+          inferred?.currentUrl,
         );
       } else {
         // legacy fallback: argusDirect 미설정 (배포 환경에서만 발생).

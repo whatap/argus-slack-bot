@@ -62,6 +62,8 @@ export async function runDirectToArgus(
   cfg: DirectRouteConfig,
   userText: string,
   pcode?: number,
+  /** 가짜 currentUrl — `screen-infer.inferCurrentUrl()` 결과 전달. */
+  currentUrl?: string,
 ): Promise<RunResult> {
   const steps: StepProgress[] = [];
   let cumulativeText = "";
@@ -78,6 +80,7 @@ export async function runDirectToArgus(
       ...(cfg.argusConversationId
         ? { conversationId: cfg.argusConversationId }
         : {}),
+      ...(currentUrl ? { currentUrl } : {}),
     },
     (progress) => {
       if (progress.subTool) {
