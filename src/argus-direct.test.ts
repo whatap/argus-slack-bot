@@ -4,9 +4,13 @@
 // 한 줄 깨지면 모든 답변 무응답. consumeSSE 통합은 e2e 영역으로 별도.
 
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { beforeEach, test } from "node:test";
 
-import { parseSSEBlock } from "./argus-direct.js";
+import {
+  __resetSubToolWarnings,
+  describeArgusSubTool,
+  parseSSEBlock,
+} from "./argus-direct.js";
 
 test("event + data 한 줄씩 → 정상 parse", () => {
   const block = 'event: message_start\ndata: {"type":"message_start","id":"msg_1"}';
@@ -98,4 +102,58 @@ test("data: 뒤 공백 1 칸 trim", () => {
 test("빈 block → null", () => {
   assert.equal(parseSSEBlock(""), null);
   assert.equal(parseSSEBlock("\n"), null);
+});
+
+// ── describeArgusSubTool drift detector ──
+
+beforeEach(() => {
+  __resetSubToolWarnings();
+});
+
+test("describeArgusSubTool — 알려진 도구 → 한국어 라벨", () => {
+  assert.equal(describeArgusSubTool("whatap_query_data"), "데이터 쿼리");
+  assert.equal(describeArgusSubTool("render_chart"), "차트 생성");
+  assert.equal(describeArgusSubTool("docs_search"), "문서 검색");
+});
+
+test("describeArgusSubTool — unknown 이름 → raw name fallback + WARN", () => {
+  const warnings: string[] = [];
+  const origWarn = console.warn;
+  console.warn = (msg: string) => warnings.push(msg);
+  try {
+    const out = describeArgusSubTool("whatap_brand_new_tool");
+    assert.equal(out, "whatap_brand_new_tool");
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /unknown sub-tool.*whatap_brand_new_tool/);
+    assert.match(warnings[0], /SUB_TOOL_DESC 매핑 추가/);
+  } finally {
+    console.warn = origWarn;
+  }
+});
+
+test("describeArgusSubTool — 같은 unknown 이름 두 번째 → WARN 1회만", () => {
+  const warnings: string[] = [];
+  const origWarn = console.warn;
+  console.warn = (msg: string) => warnings.push(msg);
+  try {
+    describeArgusSubTool("same_unknown");
+    describeArgusSubTool("same_unknown");
+    describeArgusSubTool("same_unknown");
+    assert.equal(warnings.length, 1, "노이즈 방지로 1회만 WARN");
+  } finally {
+    console.warn = origWarn;
+  }
+});
+
+test("describeArgusSubTool — 다른 unknown 이름은 각각 WARN", () => {
+  const warnings: string[] = [];
+  const origWarn = console.warn;
+  console.warn = (msg: string) => warnings.push(msg);
+  try {
+    describeArgusSubTool("unknown_a");
+    describeArgusSubTool("unknown_b");
+    assert.equal(warnings.length, 2);
+  } finally {
+    console.warn = origWarn;
+  }
 });

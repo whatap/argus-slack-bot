@@ -202,28 +202,50 @@ export function parseSSEBlock(block: string): SSEEvent | null {
   }
 }
 
-/** argus 의 sub-tool 이름을 한국어 친화 표현으로 매핑. */
+/** argus 의 sub-tool 이름을 한국어 친화 표현으로 매핑.
+ *  argus 측에 새 도구 추가/삭제 시 SUB_TOOL_DESC 도 같이 갱신 필요. 자동 sync
+ *  메커니즘은 없고 runtime drift 감지로만 (아래 WARN). 안정화되면 argus 측
+ *  `/v1/tools/metadata` 엔드포인트 노출 후 봇이 부팅 시 fetch 가 정석. */
+const SUB_TOOL_DESC: Record<string, string> = {
+  whatap_query_data: "데이터 쿼리",
+  whatap_create_promql: "PromQL 생성",
+  whatap_list_projects: "프로젝트 목록",
+  whatap_project_info: "프로젝트 정보",
+  whatap_list_agents: "에이전트 목록",
+  whatap_recent_alerts: "알림 조회",
+  whatap_organization_alerts: "조직 알림",
+  whatap_apm_anomaly: "APM 이상 탐지",
+  whatap_service_topology: "서비스 토폴로지",
+  whatap_data_availability: "데이터 가용성 확인",
+  whatap_describe_query: "쿼리 분석",
+  whatap_install_agent: "에이전트 설치",
+  whatap_list_fields: "필드 목록",
+  whatap_list_dashboards: "대시보드 목록",
+  render_chart: "차트 생성",
+  check_project_metrics: "프로젝트 메트릭 확인",
+  docs_search: "문서 검색",
+};
+
+/** 이미 WARN 출력한 unknown 이름. 한 이름은 한 번만 로그 — 운영 로그 노이즈
+ *  방지. 봇 재시작 시 reset. */
+const unknownSubToolWarned = new Set<string>();
+
 export function describeArgusSubTool(name: string): string {
-  const map: Record<string, string> = {
-    whatap_query_data: "데이터 쿼리",
-    whatap_create_promql: "PromQL 생성",
-    whatap_list_projects: "프로젝트 목록",
-    whatap_project_info: "프로젝트 정보",
-    whatap_list_agents: "에이전트 목록",
-    whatap_recent_alerts: "알림 조회",
-    whatap_organization_alerts: "조직 알림",
-    whatap_apm_anomaly: "APM 이상 탐지",
-    whatap_service_topology: "서비스 토폴로지",
-    whatap_data_availability: "데이터 가용성 확인",
-    whatap_describe_query: "쿼리 분석",
-    whatap_install_agent: "에이전트 설치",
-    whatap_list_fields: "필드 목록",
-    whatap_list_dashboards: "대시보드 목록",
-    render_table: "표 생성",
-    render_chart: "차트 생성",
-    check_project_metrics: "프로젝트 메트릭 확인",
-    read_table_guide: "데이터 정의 참조",
-    docs_search: "문서 검색",
-  };
-  return map[name] ?? name;
+  const desc = SUB_TOOL_DESC[name];
+  if (desc) return desc;
+  // Runtime drift detector — argus 가 새 sub-tool 추가했는데 봇 매핑이 안
+  // 따라잡은 경우 운영자에게 알림. 자동 PR 같은 형태는 아니지만 정기 로그
+  // 점검 시 누락 발견 가능. 사용자에겐 영향 X (raw name fallback).
+  if (!unknownSubToolWarned.has(name)) {
+    unknownSubToolWarned.add(name);
+    console.warn(
+      `[argus-direct] unknown sub-tool: "${name}" — SUB_TOOL_DESC 매핑 추가 필요. 일단 raw name 사용.`,
+    );
+  }
+  return name;
+}
+
+/** 테스트용 — warned set 초기화. */
+export function __resetSubToolWarnings(): void {
+  unknownSubToolWarned.clear();
 }
