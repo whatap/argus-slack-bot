@@ -186,7 +186,7 @@ interface SSEEvent {
   data: any;
 }
 
-function parseSSEBlock(block: string): SSEEvent | null {
+export function parseSSEBlock(block: string): SSEEvent | null {
   let event = "message";
   const dataLines: string[] = [];
   for (const line of block.split("\n")) {
