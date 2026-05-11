@@ -85,6 +85,10 @@ const USER_TOKENS_DB =
 // Slack workspace 설치 DB. user_tokens 와 같은 sqlite 파일 공유 OK.
 const INSTALLATIONS_DB =
   process.env.SLACK_INSTALLATIONS_DB || "./data/user_tokens.sqlite";
+// Thread history DB — user_tokens 와 분리 (gc 사이클이 잦아 vacuuming
+// 비용이 사용자 데이터에 영향 안 가게).
+const THREAD_HISTORY_DB =
+  process.env.SLACK_THREAD_HISTORY_DB || "./data/thread_history.sqlite";
 
 // dev.whatap.io 가 default. customer 배포 시엔 api.whatap.io 로 가야 할 수도 있음.
 const DEFAULT_WHATAP_API_URL =
@@ -209,9 +213,14 @@ async function main() {
     console.log("[argus-slack-bot] mode=single-workspace (SLACK_BOT_TOKEN)");
   }
 
-  // 2) Anthropic + thread history
+  // 2) Anthropic + thread history (SQLite-backed, 봇 재시작 후에도 thread 유지)
   const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
-  const threadHistory = new ThreadHistory(MAX_HISTORY_TURNS);
+  const threadHistory = new ThreadHistory(
+    MAX_HISTORY_TURNS,
+    30 * 60 * 1000,
+    THREAD_HISTORY_DB,
+  );
+  console.log(`[argus-slack-bot] thread history DB: ${THREAD_HISTORY_DB}`);
 
   // 3) Slack Bolt App
   // - single-workspace: token 직접 주입
@@ -667,6 +676,9 @@ async function main() {
     } catch {}
     try {
       installationStore?.close();
+    } catch {}
+    try {
+      threadHistory.close();
     } catch {}
     process.exit(0);
   };
