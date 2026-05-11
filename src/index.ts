@@ -325,17 +325,8 @@ async function main() {
     }
 
     // ── 사용자 creds 룩업 (없으면 default 폴백) ─────────────
-    let creds = tokenStore.get(userId);
-    let usingDefault = false;
-    if (!creds && DEFAULT_WHATAP_API_TOKEN) {
-      creds = {
-        whatapApiToken: DEFAULT_WHATAP_API_TOKEN,
-        argusCookie: DEFAULT_ARGUS_COOKIE || undefined,
-      };
-      usingDefault = true;
-      console.log(`[argus-slack-bot] user=${userId} using default creds`);
-    }
-    if (!creds) {
+    const resolved = resolveUserCreds(userId, tokenStore);
+    if (!resolved) {
       await say({
         text:
           ":lock: 등록된 토큰이 없어요. DM 으로 `register <whatap-api-token>` 보내주세요.\n" +
@@ -343,6 +334,10 @@ async function main() {
         thread_ts: threadTs,
       });
       return;
+    }
+    const { creds, usingDefault } = resolved;
+    if (usingDefault) {
+      console.log(`[argus-slack-bot] user=${userId} using default creds`);
     }
     void usingDefault; // 향후 응답 끝에 "데모 토큰 사용 중" 안내 hint 시 사용
 
@@ -605,12 +600,15 @@ async function main() {
       return;
     }
 
-    const creds = tokenStore.get(userId);
+    // chipActionsToBlocks 와 동일한 폴백 정책 — default cookie 도 인정.
+    // 한 쪽만 default 인지하면 'chip 은 보이는데 클릭하면 미등록 안내' UX 절벽.
+    const resolved = resolveUserCreds(userId, tokenStore);
+    const creds = resolved?.creds;
     if (!creds || !creds.argusCookie) {
       await client.chat.postEphemeral({
         channel,
         user: userId,
-        text: `:warning: argus cookie 미등록 — DM 으로 \`register\` 명령으로 cookie 등록 후 다시 시도`,
+        text: `:warning: argus cookie 미등록 — DM 으로 \`cookie JSESSIONID=...\` 등록 후 다시 시도 (또는 운영자 default cookie 설정 요청)`,
         thread_ts: threadTs,
       });
       return;
@@ -769,6 +767,29 @@ async function main() {
   };
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
+}
+
+/** 사용자 creds 룩업 + default 폴백. 미등록 사용자에게도 운영자 default
+ *  토큰/쿠키 자동 적용. 등록 사용자는 본인 row 만 사용 (보안 격리).
+ *  handle() 의 본 호출 흐름 + chip apply/cancel action handler 둘 다 같은
+ *  의미여야 일관성 — 한쪽만 default 폴백 인지하면 'chip 보이는데 클릭하면
+ *  cookie 미등록 안내' 같은 불일치 발생. */
+function resolveUserCreds(
+  userId: string,
+  tokenStore: UserTokenStore,
+): { creds: UserCreds; usingDefault: boolean } | null {
+  const direct = tokenStore.get(userId);
+  if (direct) return { creds: direct, usingDefault: false };
+  if (DEFAULT_WHATAP_API_TOKEN) {
+    return {
+      creds: {
+        whatapApiToken: DEFAULT_WHATAP_API_TOKEN,
+        argusCookie: DEFAULT_ARGUS_COOKIE || undefined,
+      },
+      usingDefault: true,
+    };
+  }
+  return null;
 }
 
 /** UserCreds + 운영측 ARGUS_URL/TOKEN → MCP child env 빌드.
