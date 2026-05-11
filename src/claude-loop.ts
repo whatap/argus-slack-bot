@@ -121,6 +121,23 @@ export async function runClaudeWithMcp(
     cfg.onProgress?.({ text: cumulativeText, toolInProgress, toolCallLog, hops });
   };
 
+  // Prompt caching: tools 의 마지막 element 에 cache_control 박으면 SDK 가
+  // system + tools prefix 를 5분 TTL ephemeral cache 로 잡는다.
+  //   - 한 turn 내 hop 간 (예: ask_whatap_expert 호출 후 final text hop) cache hit
+  //   - 같은 thread follow-up 이 5분 안에 오면 cache hit
+  //   - minimum 1024 tokens 임계점 미달 시 silently 무시 — 안전
+  // 비용 영향: cache write 1.25x, cache read 0.1x. hop≥2 이면 절감 시작.
+  const cachedTools =
+    tools.length > 0
+      ? [
+          ...tools.slice(0, -1),
+          {
+            ...tools[tools.length - 1],
+            cache_control: { type: "ephemeral" as const },
+          },
+        ]
+      : tools;
+
   for (hops = 0; hops < maxHops; hops++) {
     // 이번 hop 시작 — 누적 텍스트에 segment 구분자 (앞 hop 결과 + tool result 섞임 방지)
     const hopStartLen = cumulativeText.length;
@@ -129,7 +146,7 @@ export async function runClaudeWithMcp(
       model: cfg.model,
       max_tokens: cfg.maxTokens,
       system: cfg.system,
-      tools,
+      tools: cachedTools,
       messages: [...history, ...newMessages],
     });
 
