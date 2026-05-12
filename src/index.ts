@@ -1106,6 +1106,7 @@ function onboardingBlocks(): unknown[] {
 
 // trigger 가 명확한 인사 / 도움말 요청인지. 정확 일치만 매칭 (다른 질문에
 // 우연히 트리거되지 않게). lowercase + trim 비교.
+// 한국어 줄임말 ("ㅎㅇ", "ㅎ2") 도 포함 — 실 사용자가 이런 표현 많이 씀.
 function isOnboardingTrigger(text: string): boolean {
   const t = text.trim().toLowerCase();
   return (
@@ -1114,13 +1115,21 @@ function isOnboardingTrigger(text: string): boolean {
     t === "도움말" ||
     t === "hi" ||
     t === "hello" ||
+    t === "hey" ||
+    t === "yo" ||
     t === "안녕" ||
     t === "안녕하세요" ||
+    t === "ㅎㅇ" ||
+    t === "ㅎ2" ||
+    t === "ㅎㅎ" ||
+    t === "하이" ||
+    t === "안뇽" ||
     t === "start" ||
     t === "시작" ||
     t === "menu" ||
     t === "메뉴" ||
-    t === "?"
+    t === "?" ||
+    t === "??"
   );
 }
 
