@@ -187,11 +187,34 @@ async function consumeSSE(
   }
 
   return {
-    text: text.trim(),
+    text: sanitizeSlackText(text.trim()),
     ...(conversationId ? { conversationId } : {}),
     ...(recommendedQuestions ? { recommendedQuestions } : {}),
     ...(actions.length > 0 ? { actions } : {}),
   };
+}
+
+// argus LLM 이 가끔 HTML 태그 (<strong>, <em>, <br>) 나 GitHub-style `**bold**`
+// 을 박을 때 Slack 은 literal 로 표시해 사용자에게 raw <strong>X</strong> 가
+// 그대로 보임 — argus system prompt (Slack mrkdwn) 가이드를 LLM 이 무시하는
+// 케이스에 대비한 안전망. 알려진 HTML 화이트리스트만 변환하고 그 외
+// `<https://...|label>` 같은 Slack 자체 마크업은 건드리지 않는다.
+function sanitizeSlackText(s: string): string {
+  return (
+    s
+      // 두 별표 → 한 별표 (Slack 은 ** 를 literal 처리)
+      .replace(/\*\*(.+?)\*\*/g, "*$1*")
+      // HTML inline → Slack mrkdwn
+      .replace(/<strong>(.*?)<\/strong>/gis, "*$1*")
+      .replace(/<b>(.*?)<\/b>/gis, "*$1*")
+      .replace(/<em>(.*?)<\/em>/gis, "_$1_")
+      .replace(/<i>(.*?)<\/i>/gis, "_$1_")
+      .replace(/<code>(.*?)<\/code>/gis, "`$1`")
+      // HTML link → Slack 링크 syntax
+      .replace(/<a\s+href="([^"]+)"[^>]*>(.*?)<\/a>/gis, "<$1|$2>")
+      // 블록 / 컨테이너 태그 strip — 텍스트는 보존, 태그만 제거
+      .replace(/<\/?(br|p|div|span|table|thead|tbody|tr|td|th|ul|ol|li|h[1-6])\s*\/?>/gi, "")
+  );
 }
 
 interface SSEEvent {
