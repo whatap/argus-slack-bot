@@ -61,12 +61,14 @@ export async function askWhatapExpertDirect(
   // 인증 layer 가 front.apm/nginx/ALB 어딘가에서 자체 검증되어 우회 어려움.
   // 봇이 사용자 cookie 를 가지고 있으니 /v1/chat 으로 호출하면 토큰 무관.
   // body field 는 ChatRequest 형식: query → message.
+  // context.client="slack" — argus 가 출력 채널이 텍스트 전용임을 인지해서
+  // 차트·대시보드 도구 회피 + 후속 질문에서 시각화 항목 제외.
   const body: Record<string, unknown> = { message: params.query };
   if (typeof params.pcode === "number") body.pcode = params.pcode;
   if (params.conversationId) body.conversationId = params.conversationId;
-  if (params.currentUrl) {
-    body.context = { currentUrl: params.currentUrl };
-  }
+  const context: Record<string, unknown> = { client: "slack" };
+  if (params.currentUrl) context.currentUrl = params.currentUrl;
+  body.context = context;
   // /v1/chat 은 Cookie 헤더에서 직접 읽음 — body.cookie 안 씀.
 
   // 디버그: query 와 routing 추적.
