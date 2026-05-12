@@ -815,7 +815,20 @@ function resolveUserCreds(
   tokenStore: UserTokenStore,
 ): { creds: UserCreds; usingDefault: boolean } | null {
   const direct = tokenStore.get(userId);
-  if (direct) return { creds: direct, usingDefault: false };
+  if (direct) {
+    // 시연 환경 안정성: db 에 사용자별 데이터가 있어도 argus_cookie 만은
+    // .env 의 DEFAULT_ARGUS_COOKIE 로 강제. 사용자가 옛 cookie 를 db 에
+    // 등록해둔 채 만료된 경우 .env 갱신 한 번으로 일괄 정상화 — 사용자가
+    // 봇 DM 에서 `cookie ...` 명령 다시 보낼 필요 없음. 다른 필드
+    // (whatap_api_token / whatap_api_url) 는 사용자 등록값 유지.
+    return {
+      creds: {
+        ...direct,
+        argusCookie: DEFAULT_ARGUS_COOKIE || direct.argusCookie,
+      },
+      usingDefault: false,
+    };
+  }
   if (DEFAULT_WHATAP_API_TOKEN) {
     return {
       creds: {
