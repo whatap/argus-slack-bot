@@ -552,6 +552,13 @@ async function main() {
     const threadTs = event.thread_ts ?? event.ts;
     const threadKey = `${channel}:${threadTs}`;
     const cleanText = event.text.replace(/<@[A-Z0-9]+>/g, "").trim();
+    // 인사 / 도움말 trigger 또는 빈 멘션 → LLM 호출 없이 onboarding chip 만
+    // 표시. 사용자가 chip 클릭해서 의미 있는 질문으로 진입.
+    if (cleanText === "" || isOnboardingTrigger(cleanText)) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await say({ thread_ts: threadTs, blocks: onboardingBlocks() as any, text: "WhaTap AI 안내" });
+      return;
+    }
     await handle({
       text: cleanText,
       userId: event.user ?? "",
@@ -571,6 +578,13 @@ async function main() {
     if (m.subtype) return;
     const text = String(m.text ?? "").trim();
     if (!text) return;
+    // DM 에서 인사 / 도움말 패턴 → onboarding chip 만 응답. 일반 명령
+    // (register/cookie/whoami/logout) 은 handle() 안에서 따로 처리.
+    if (isOnboardingTrigger(text)) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await say({ blocks: onboardingBlocks() as any, text: "WhaTap AI 안내" });
+      return;
+    }
     const channel = String(m.channel ?? "");
     const ts = String(m.ts ?? "");
     const threadTs = String(m.thread_ts ?? ts);
@@ -1048,6 +1062,87 @@ function recommendedQuestionsToBlocks(questions: string[]): unknown[] {
     },
     { type: "actions", elements },
   ];
+}
+
+// 처음 봇과 대화하는 사용자에게 use case 를 노출하는 onboarding 메시지.
+// "help" / "안녕" / "ㅎㅇ" 같은 trigger 메시지에 응답. chip 은 기존
+// followup_question action_id 재사용해서 클릭 시 같은 핸들러로 새 turn 처리.
+//
+// 사용자 컨텍스트 (프로젝트 list, 모니터링 데이터) 모르는 첫 진입자도 자연스럽게
+// 시작할 수 있도록 generic hero query 5개. 가정 박힌 단어 ("GPU 비용 최적화"
+// 같이) 회피.
+const ONBOARDING_HERO_QUERIES = [
+  "내 프로젝트 보여줘",
+  "지금 어디 문제 있어?",
+  "최근 24시간 알림 현황",
+  "이상 징후 있는 프로젝트 찾아줘",
+  "알림 설정 도와줘",
+];
+
+function onboardingBlocks(): unknown[] {
+  const buttons = ONBOARDING_HERO_QUERIES.map((q, i) => ({
+    type: "button",
+    text: { type: "plain_text", text: q.length > 75 ? q.slice(0, 72) + "..." : q },
+    action_id: `followup_question:${i}`,
+    value: q,
+  }));
+  return [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text:
+          ":wave: *안녕하세요! WhaTap AI 입니다.*\n" +
+          "WhaTap 모니터링 데이터를 자연어로 물어보세요. 프로젝트 현황, 알림 분석, 이상 징후 탐지, 임계값 추천까지 도와드립니다.",
+      },
+    },
+    {
+      type: "context",
+      elements: [
+        { type: "mrkdwn", text: ":point_right: *이런 질문 해보세요 — 클릭하면 자동 전송:*" },
+      ],
+    },
+    { type: "actions", elements: buttons },
+    {
+      type: "context",
+      elements: [
+        {
+          type: "mrkdwn",
+          text:
+            "_직접 입력해도 됩니다. 채널에서 사용하려면 `@WhaTap AI` 멘션. 도움말이 필요하면 `help` 입력._",
+        },
+      ],
+    },
+  ];
+}
+
+// trigger 가 명확한 인사 / 도움말 요청인지. 정확 일치만 매칭 (다른 질문에
+// 우연히 트리거되지 않게). lowercase + trim 비교.
+// 한국어 줄임말 ("ㅎㅇ", "ㅎ2") + 영어 줄임 (hey, yo) 포함.
+function isOnboardingTrigger(text: string): boolean {
+  const t = text.trim().toLowerCase();
+  return (
+    t === "help" ||
+    t === "도움" ||
+    t === "도움말" ||
+    t === "hi" ||
+    t === "hello" ||
+    t === "hey" ||
+    t === "yo" ||
+    t === "안녕" ||
+    t === "안녕하세요" ||
+    t === "ㅎㅇ" ||
+    t === "ㅎ2" ||
+    t === "ㅎㅎ" ||
+    t === "하이" ||
+    t === "안뇽" ||
+    t === "start" ||
+    t === "시작" ||
+    t === "menu" ||
+    t === "메뉴" ||
+    t === "?" ||
+    t === "??"
+  );
 }
 
 /** cookie 미등록 사용자에게 적용 chip 발생 시 답변 본문에 추가할 안내.
