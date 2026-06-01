@@ -18,6 +18,16 @@ const SLACK_MSG_MAX = 3500;
 export function toSlackMrkdwn(md: string): string {
   let out = md;
 
+  // 0) HTML inline tag → mrkdwn. LLM (특히 claude / qwen) 이 강조용으로 markdown
+  //    대신 HTML 박는 케이스 — 그대로 두면 사용자가 `<strong>14개</strong>` raw 노출.
+  //    nested 없는 단순 태그만 매칭 — 복잡한 HTML 은 argus 측 system prompt 로 회피.
+  out = out.replace(/<\s*strong\s*>([^<]+)<\s*\/\s*strong\s*>/gi, "*$1*");
+  out = out.replace(/<\s*b\s*>([^<]+)<\s*\/\s*b\s*>/gi, "*$1*");
+  out = out.replace(/<\s*em\s*>([^<]+)<\s*\/\s*em\s*>/gi, "_$1_");
+  out = out.replace(/<\s*i\s*>([^<]+)<\s*\/\s*i\s*>/gi, "_$1_");
+  out = out.replace(/<\s*code\s*>([^<]+)<\s*\/\s*code\s*>/gi, "`$1`");
+  out = out.replace(/<\s*br\s*\/?\s*>/gi, "\n");
+
   // 1) 표 → 코드블록.
   //    | a | b | c |
   //    |---|---|---|
