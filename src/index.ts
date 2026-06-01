@@ -29,6 +29,7 @@ import { humanizeError } from "./humanize.js";
 import { inferCurrentUrl } from "./screen-infer.js";
 import { SqliteInstallationStore } from "./installations.js";
 import { landingPageHtml } from "./landing.js";
+import { privacyPageHtml, termsPageHtml } from "./legal.js";
 import { McpClientPool } from "./mcp-pool.js";
 import { splitForSlack, toSlackMrkdwn } from "./slack-format.js";
 import { UserTokenStore, maskToken, type UserCreds } from "./user-tokens.js";
@@ -104,6 +105,12 @@ const DEFAULT_WHATAP_API_URL =
 // 사용자 cookie 가 있으면 cookie 경로, 없으면 token-only.
 const ARGUS_URL = process.env.ARGUS_URL || "";
 const ARGUS_API_TOKEN = process.env.ARGUS_API_TOKEN || "";
+
+// Slack App ID — OAuth 콜백 성공 시 사용자를 자기 Slack workspace 로 다시
+// 보내는 deep link 에 박힘 (slack.com/app_redirect?app=<id>&team=<team>).
+// App Directory 등재 검증 요구사항 — Redirect URL 이 200 HTML 페이지가 아니라
+// slack.com 으로 302 해야 함. App ID 는 api.slack.com/apps/<ID> 의 ID 부분.
+const SLACK_APP_ID = process.env.SLACK_APP_ID || "A0AFUKNJ5SS";
 
 // 부팅 시 즉시 디버그 로그 — 401 진단용. 토큰 전체 X, prefix + length 만.
 console.log(
@@ -266,8 +273,33 @@ async function main() {
         installerOptions: {
           port: SLACK_OAUTH_PORT,
           // 기본 path: /slack/install (시작), /slack/oauth_redirect (콜백)
+          // directInstall=true → /slack/install 가 HTML 페이지 안 보여주고
+          // 바로 slack.com/oauth/v2/authorize 로 302. Slack Marketplace 의
+          // "Direct install URL" 흐름과 매칭.
+          directInstall: true,
+          // App Directory 등재 요구사항 — 콜백 성공 시 slack.com 으로 302 redirect
+          // (사용자 자기 workspace 로 자동 복귀). default 는 success HTML 페이지 200
+          // 인데 Slack 검증이 "redirect URL must return 302 to slack.com" 으로 거부.
+          callbackOptions: {
+            success: (installation, _installOptions, _req, res) => {
+              const teamId = installation?.team?.id || "";
+              const location = `https://slack.com/app_redirect?app=${SLACK_APP_ID}${teamId ? `&team=${teamId}` : ""}`;
+              res.writeHead(302, { Location: location });
+              res.end();
+            },
+            // failure 케이스 (state 미스매치 / invalid code 등) 도 302 to slack.com.
+            // Slack App Directory 검증이 redirect URL 의 응답을 자동 테스트할 때
+            // fake code 보낼 수 있어 — 그 응답도 302 to slack.com 이어야 검증 통과.
+            failure: (_error, _installOptions, _req, res) => {
+              res.writeHead(302, {
+                Location: `https://slack.com/app_redirect?app=${SLACK_APP_ID}`,
+              });
+              res.end();
+            },
+          },
         },
-        // root 에 마케팅 랜딩 페이지 — QR / 데모용
+        // root 에 마케팅 랜딩 페이지 — QR / 데모용.
+        // /privacy + /terms — Slack App Directory submit 시 Privacy / ToS URL 박힘.
         customRoutes: [
           {
             path: "/",
@@ -275,6 +307,22 @@ async function main() {
             handler: (_req, res) => {
               res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
               res.end(landingPageHtml());
+            },
+          },
+          {
+            path: "/privacy",
+            method: ["GET"],
+            handler: (_req, res) => {
+              res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+              res.end(privacyPageHtml());
+            },
+          },
+          {
+            path: "/terms",
+            method: ["GET"],
+            handler: (_req, res) => {
+              res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+              res.end(termsPageHtml());
             },
           },
         ],
@@ -308,7 +356,9 @@ async function main() {
         }) => Promise<unknown>;
       };
     };
-    threadTs: string;
+    // undefined 면 main DM 흐름에 답함 (새 DM 메시지). string 이면 그 thread 안 reply
+    // (채널 멘션 또는 사용자가 명시적으로 thread 안에서 보낸 케이스).
+    threadTs?: string;
   }) => {
     const { text, userId, isDm, threadKey, say, client, threadTs } = params;
     if (!text) return;
@@ -465,7 +515,11 @@ async function main() {
         threadHistory.setArgusConvId(threadKey, result.argusConversationId);
       }
 
-      const formattedText = toSlackMrkdwn(result.text || "_(빈 응답)_");
+      // 인사 trigger 면 chip fallback — argus 가 첫 인사에 recommendedQuestions
+      // 발급 안 하는 케이스 보강 (정적 5개 generic 쿼리). 자기소개 prefix 는
+      // argus 응답이 이미 "WhaTap AI 어시스턴트입니다" 시작이라 중복 회피.
+      const isGreeting = isGreetingTrigger(text);
+      const formattedText = stripArgusBranding(toSlackMrkdwn(result.text || "_(빈 응답)_"));
       const toolFooter = renderToolFooter(result.toolCallLog);
       const cookieHint = renderCookieGateHint(result.chipActions, creds);
       const formatted = [formattedText, cookieHint, toolFooter]
@@ -478,9 +532,16 @@ async function main() {
       // argus /v1/event-rules/apply 또는 /cancel 호출.
       const chipBlocks = chipActionsToBlocks(result.chipActions, creds);
       // 추천 후속 질문 → Block Kit button. 클릭 시 같은 thread 의 새 turn.
-      const followupBlocks = recommendedQuestionsToBlocks(
-        result.recommendedQuestions ?? [],
-      );
+      // argus 가 발급 안 한 경우 항상 fallback (연우 피드백: 매 응답 chip 3개).
+      // greeting 일 때는 더 풍부한 5개, 일반 turn 은 3개.
+      const argusFollowups = result.recommendedQuestions ?? [];
+      const followupQueries =
+        argusFollowups.length > 0
+          ? argusFollowups
+          : isGreeting
+            ? STATIC_GREETING_CHIPS
+            : STATIC_FOLLOWUP_FALLBACK;
+      const followupBlocks = recommendedQuestionsToBlocks(followupQueries);
       const extraBlocks = [...chipBlocks, ...followupBlocks];
       const lastIdx = chunks.length - 1;
 
@@ -552,13 +613,6 @@ async function main() {
     const threadTs = event.thread_ts ?? event.ts;
     const threadKey = `${channel}:${threadTs}`;
     const cleanText = event.text.replace(/<@[A-Z0-9]+>/g, "").trim();
-    // 인사 / 도움말 trigger 또는 빈 멘션 → LLM 호출 없이 onboarding chip 만
-    // 표시. 사용자가 chip 클릭해서 의미 있는 질문으로 진입.
-    if (cleanText === "" || isOnboardingTrigger(cleanText)) {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      await say({ thread_ts: threadTs, blocks: onboardingBlocks() as any, text: "WhaTap AI 안내" });
-      return;
-    }
     await handle({
       text: cleanText,
       userId: event.user ?? "",
@@ -578,23 +632,20 @@ async function main() {
     if (m.subtype) return;
     const text = String(m.text ?? "").trim();
     if (!text) return;
-    // DM 에서 인사 / 도움말 패턴 → onboarding chip 만 응답. 일반 명령
-    // (register/cookie/whoami/logout) 은 handle() 안에서 따로 처리.
-    if (isOnboardingTrigger(text)) {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      await say({ blocks: onboardingBlocks() as any, text: "WhaTap AI 안내" });
-      return;
-    }
     const channel = String(m.channel ?? "");
     const ts = String(m.ts ?? "");
-    const threadTs = String(m.thread_ts ?? ts);
-    const threadKey = `${channel}:${threadTs}`;
+    // DM 에서 사용자가 명시적으로 thread 안에 있을 때만 thread reply. 새 DM
+    // 메시지 (m.thread_ts 없음) 는 threadTs=undefined 로 두어 main 흐름에 답함.
+    // 이전엔 자기 ts 를 parent 로 강제 thread 화 → 사용자가 채팅 탭 main 에서
+    // 봇 응답을 thread 댓글로만 보던 회귀.
+    const replyThreadTs = m.thread_ts ? String(m.thread_ts) : undefined;
+    const threadKey = `${channel}:${replyThreadTs ?? ts}`;
     await handle({
       text,
       userId: String(m.user ?? ""),
       isDm: true,
       threadKey,
-      threadTs,
+      threadTs: replyThreadTs,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       say: (args) => say(args as any),
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -814,19 +865,7 @@ function resolveUserCreds(
   tokenStore: UserTokenStore,
 ): { creds: UserCreds; usingDefault: boolean } | null {
   const direct = tokenStore.get(userId);
-  if (direct) {
-    // 모든 사용자가 .env 의 DEFAULT_ARGUS_COOKIE 사용하도록 통일 — db 에
-    // 등록된 사용자별 argus_cookie 는 무시. cookie 만료 시 .env 갱신 +
-    // 봇 재기동 한 번으로 일괄 정상화 가능. 다른 필드 (whatap_api_token /
-    // whatap_api_url) 는 사용자 등록값 유지 — 각자 자기 WhaTap 계정 토큰.
-    return {
-      creds: {
-        ...direct,
-        argusCookie: DEFAULT_ARGUS_COOKIE || direct.argusCookie,
-      },
-      usingDefault: false,
-    };
-  }
+  if (direct) return { creds: direct, usingDefault: false };
   if (DEFAULT_WHATAP_API_TOKEN) {
     return {
       creds: {
@@ -859,7 +898,8 @@ async function handleCommand(
   ctx: {
     userId: string;
     isDm: boolean;
-    threadTs: string;
+    // undefined 면 main 흐름에 답함 (DM). string 이면 thread reply.
+    threadTs?: string;
     say: (args: { text: string; thread_ts?: string; blocks?: unknown[] }) => Promise<unknown>;
     tokenStore: UserTokenStore;
   },
@@ -1040,6 +1080,66 @@ function composeStepStreamingBody(snap: DirectRouteSnap): string {
 /** argus 가 발급한 추천 질문 (최대 5개) → Slack Block Kit button row.
  *  답변 본문에는 안 넣고 (LLM hallucinate 방지) chip 으로만. 사용자가 클릭하면
  *  app.action(`followup_question:.*`) 핸들러가 같은 thread 의 새 turn 으로 처리. */
+// argus 의 system prompt 가 자기 자신을 "Argus" 라고 소개하는 경향이 있는데
+// 사용자에게는 "WhaTap AI 어시스턴트" 로 통일 노출. 봇 layer 에서 단순 string
+// replace 로 sanitize — 시연용 임시 패치 (정답은 argus system_prompt.md 수정).
+// case-sensitive + word boundary 로 도구 결과의 일반 영어 단어 영향 회피.
+function stripArgusBranding(text: string): string {
+  let out = text;
+  // "WhaTap AI 어시스턴트 *Argus*입니다" / "Argus 입니다" → 자기소개 단어 cleanup
+  out = out.replace(/\s*\*?Argus\*?(?=\s*(?:입니다|이에요|예요|이야|이라고|라고))/g, "");
+  // bold/italic 형 "*Argus*" → 제거
+  out = out.replace(/\*Argus\*/g, "");
+  // 단독 "Argus" 단어 (대문자, word boundary) → "WhaTap AI 어시스턴트"
+  out = out.replace(/\bArgus\b/g, "WhaTap AI 어시스턴트");
+  // 자기소개 wording 통일 — argus 가 "WhaTap 관찰 도구", "WhaTap 봇" 등으로
+  // 자기를 소개하는 경향. 사용자 요청: "WhaTap AI 어시스턴트" 로 통일.
+  out = out.replace(/WhaTap\s*(?:관찰\s*도구|관찰\s*도우미|모니터링\s*도구|모니터링\s*봇|봇|에이전트|어시스턴트(?!\s*입니다))/g, "WhaTap AI 어시스턴트");
+  // 중복 공백 정리
+  out = out.replace(/ {2,}/g, " ");
+  return out;
+}
+
+// 인사 trigger — 사용자가 "ㅎㅇ", "안녕", "help" 같은 짧은 인사 / 도움말
+// 요청을 보냈는지 lowercase + trim 정확 일치로 판별. handle() 의 후처리에서
+// argus 응답에 자기소개 prefix 와 추천 후속 질문 chip fallback 을 붙이는 데 사용.
+// onboardingBlocks (4-block 풍부 안내) 분기를 다시 박지는 않는다 — 그게 "내역"
+// 알림 회귀의 원인이었음. argus 가 발급한 형식과 100% 동일한 recommendedQuestions
+// chip (context + actions 2 block) 만 fallback.
+function isGreetingTrigger(text: string): boolean {
+  const t = text.trim().toLowerCase();
+  return (
+    t === "help" || t === "도움" || t === "도움말" ||
+    t === "hi" || t === "hello" || t === "hey" || t === "yo" ||
+    t === "안녕" || t === "안녕하세요" ||
+    t === "ㅎㅇ" || t === "ㅎ2" || t === "ㅎㅎ" ||
+    t === "하이" || t === "안뇽" ||
+    t === "start" || t === "시작" ||
+    t === "menu" || t === "메뉴" ||
+    t === "?" || t === "??"
+  );
+}
+
+// argus 가 첫 인사 응답에 recommended_questions 발급 안 할 때 정적 fallback.
+// 너무 구체적 (GPU 비용 최적화 등) 가정 박힌 단어는 회피 — 사용자가 자기
+// 프로젝트 / 데이터 모르는 첫 진입자도 자연스럽게 시작 가능한 generic 5개.
+const STATIC_GREETING_CHIPS = [
+  "내 프로젝트 보여줘",
+  "지금 어디 문제 있어?",
+  "최근 24시간 알림 현황",
+  "이상 징후 있는 프로젝트 찾아줘",
+  "알림 설정 도와줘",
+];
+
+// argus 가 일반 turn 에 recommended_questions 발급 안 했을 때 기본 fallback.
+// 사용자 피드백 (연우): 매 응답마다 chip 3개 보이는 게 좋다. 컨텍스트 부정합
+// 위험 있지만 chip 부재보다 낫다. greeting 보다 짧게 3개.
+const STATIC_FOLLOWUP_FALLBACK = [
+  "프로젝트 상태 확인해줘",
+  "최근 알림 현황",
+  "이상 징후 찾아줘",
+];
+
 function recommendedQuestionsToBlocks(questions: string[]): unknown[] {
   if (questions.length === 0) return [];
   // Slack action 블록은 한 row 에 element 최대 25개. 라벨 75자 제한.
@@ -1062,87 +1162,6 @@ function recommendedQuestionsToBlocks(questions: string[]): unknown[] {
     },
     { type: "actions", elements },
   ];
-}
-
-// 처음 봇과 대화하는 사용자에게 use case 를 노출하는 onboarding 메시지.
-// "help" / "안녕" / "ㅎㅇ" 같은 trigger 메시지에 응답. chip 은 기존
-// followup_question action_id 재사용해서 클릭 시 같은 핸들러로 새 turn 처리.
-//
-// 사용자 컨텍스트 (프로젝트 list, 모니터링 데이터) 모르는 첫 진입자도 자연스럽게
-// 시작할 수 있도록 generic hero query 5개. 가정 박힌 단어 ("GPU 비용 최적화"
-// 같이) 회피.
-const ONBOARDING_HERO_QUERIES = [
-  "내 프로젝트 보여줘",
-  "지금 어디 문제 있어?",
-  "최근 24시간 알림 현황",
-  "이상 징후 있는 프로젝트 찾아줘",
-  "알림 설정 도와줘",
-];
-
-function onboardingBlocks(): unknown[] {
-  const buttons = ONBOARDING_HERO_QUERIES.map((q, i) => ({
-    type: "button",
-    text: { type: "plain_text", text: q.length > 75 ? q.slice(0, 72) + "..." : q },
-    action_id: `followup_question:${i}`,
-    value: q,
-  }));
-  return [
-    {
-      type: "section",
-      text: {
-        type: "mrkdwn",
-        text:
-          ":wave: *안녕하세요! WhaTap AI 입니다.*\n" +
-          "WhaTap 모니터링 데이터를 자연어로 물어보세요. 프로젝트 현황, 알림 분석, 이상 징후 탐지, 임계값 추천까지 도와드립니다.",
-      },
-    },
-    {
-      type: "context",
-      elements: [
-        { type: "mrkdwn", text: ":point_right: *이런 질문 해보세요 — 클릭하면 자동 전송:*" },
-      ],
-    },
-    { type: "actions", elements: buttons },
-    {
-      type: "context",
-      elements: [
-        {
-          type: "mrkdwn",
-          text:
-            "_직접 입력해도 됩니다. 채널에서 사용하려면 `@WhaTap AI` 멘션. 도움말이 필요하면 `help` 입력._",
-        },
-      ],
-    },
-  ];
-}
-
-// trigger 가 명확한 인사 / 도움말 요청인지. 정확 일치만 매칭 (다른 질문에
-// 우연히 트리거되지 않게). lowercase + trim 비교.
-// 한국어 줄임말 ("ㅎㅇ", "ㅎ2") + 영어 줄임 (hey, yo) 포함.
-function isOnboardingTrigger(text: string): boolean {
-  const t = text.trim().toLowerCase();
-  return (
-    t === "help" ||
-    t === "도움" ||
-    t === "도움말" ||
-    t === "hi" ||
-    t === "hello" ||
-    t === "hey" ||
-    t === "yo" ||
-    t === "안녕" ||
-    t === "안녕하세요" ||
-    t === "ㅎㅇ" ||
-    t === "ㅎ2" ||
-    t === "ㅎㅎ" ||
-    t === "하이" ||
-    t === "안뇽" ||
-    t === "start" ||
-    t === "시작" ||
-    t === "menu" ||
-    t === "메뉴" ||
-    t === "?" ||
-    t === "??"
-  );
 }
 
 /** cookie 미등록 사용자에게 적용 chip 발생 시 답변 본문에 추가할 안내.
