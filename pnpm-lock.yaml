@@ -16,7 +16,7 @@ importers:
         version: 1.29.0(zod@4.4.1)
       '@slack/bolt':
         specifier: ^3.21.0
-        version: 3.22.0
+        version: 3.22.0(debug@4.4.3)
       better-sqlite3:
         specifier: ^12.9.0
         version: 12.9.0
@@ -814,8 +814,8 @@ packages:
   fix-dts-default-cjs-exports@1.0.1:
     resolution: {integrity: sha512-pVIECanWFC61Hzl2+oOCtoJ3F17kglZC/6N94eRWycFgBH35hHx0Li604ZIzhseh97mf2p0cv7vVrOZGoqhlEg==}
 
-  follow-redirects@1.16.0:
-    resolution: {integrity: sha512-y5rN/uOsadFT/JfYwhxRS5R7Qce+g3zG97+JrtFZlC9klX/W5hD7iiLzScI4nZqUS7DNUdhPgw4xI8W2LuXlUw==}
+  follow-redirects@1.16.1:
+    resolution: {integrity: sha512-FNvFGzoMLWmE6Yj9spb/zjd7yiNCHiAW9/Tg9CXrQ8wuu32HtlJOwWO11OJafl5FfY3DxTdQ0vj42zU1kvv5jg==}
     engines: {node: '>=4.0'}
     peerDependencies:
       debug: '*'
@@ -1917,17 +1917,17 @@ snapshots:
   '@rollup/rollup-win32-x64-msvc@4.60.2':
     optional: true
 
-  '@slack/bolt@3.22.0':
+  '@slack/bolt@3.22.0(debug@4.4.3)':
     dependencies:
       '@slack/logger': 4.0.1
-      '@slack/oauth': 2.6.3
-      '@slack/socket-mode': 1.3.6
+      '@slack/oauth': 2.6.3(debug@4.4.3)
+      '@slack/socket-mode': 1.3.6(debug@4.4.3)
       '@slack/types': 2.20.1
-      '@slack/web-api': 6.13.0
+      '@slack/web-api': 6.13.0(debug@4.4.3)
       '@types/express': 4.17.25
       '@types/promise.allsettled': 1.0.6
       '@types/tsscmp': 1.0.2
-      axios: 1.15.2
+      axios: 1.15.2(debug@4.4.3)
       express: 4.22.1
       path-to-regexp: 8.4.2
       promise.allsettled: 1.0.7
@@ -1947,10 +1947,10 @@ snapshots:
     dependencies:
       '@types/node': 22.19.17
 
-  '@slack/oauth@2.6.3':
+  '@slack/oauth@2.6.3(debug@4.4.3)':
     dependencies:
       '@slack/logger': 3.0.0
-      '@slack/web-api': 6.13.0
+      '@slack/web-api': 6.13.0(debug@4.4.3)
       '@types/jsonwebtoken': 8.5.9
       '@types/node': 22.19.17
       jsonwebtoken: 9.0.3
@@ -1958,10 +1958,10 @@ snapshots:
     transitivePeerDependencies:
       - debug
 
-  '@slack/socket-mode@1.3.6':
+  '@slack/socket-mode@1.3.6(debug@4.4.3)':
     dependencies:
       '@slack/logger': 3.0.0
-      '@slack/web-api': 6.13.0
+      '@slack/web-api': 6.13.0(debug@4.4.3)
       '@types/node': 22.19.17
       '@types/ws': 7.4.7
       eventemitter3: 5.0.4
@@ -1974,13 +1974,13 @@ snapshots:
 
   '@slack/types@2.20.1': {}
 
-  '@slack/web-api@6.13.0':
+  '@slack/web-api@6.13.0(debug@4.4.3)':
     dependencies:
       '@slack/logger': 3.0.0
       '@slack/types': 2.20.1
       '@types/is-stream': 1.1.0
       '@types/node': 22.19.17
-      axios: 1.15.2
+      axios: 1.15.2(debug@4.4.3)
       eventemitter3: 3.1.2
       form-data: 2.5.5
       is-electron: 2.2.2
@@ -2141,9 +2141,9 @@ snapshots:
     dependencies:
       possible-typed-array-names: 1.1.0
 
-  axios@1.15.2:
+  axios@1.15.2(debug@4.4.3):
     dependencies:
-      follow-redirects: 1.16.0
+      follow-redirects: 1.16.1(debug@4.4.3)
       form-data: 4.0.5
       proxy-from-env: 2.1.0
     transitivePeerDependencies:
@@ -2599,7 +2599,9 @@ snapshots:
       mlly: 1.8.2
       rollup: 4.60.2
 
-  follow-redirects@1.16.0: {}
+  follow-redirects@1.16.1(debug@4.4.3):
+    optionalDependencies:
+      debug: 4.4.3
 
   for-each@0.3.5:
     dependencies:
