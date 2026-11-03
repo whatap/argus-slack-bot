@@ -1,7 +1,23 @@
 # argus-slack-bot
 
 Slack 워크스페이스에서 `@argus` 멘션으로 WhaTap 도메인 질의응답.
-내부 chain: **Slack → Claude API (claude-opus-4-7) → whatap-open-mcp-aitf MCP → argus `/v1/agent` → dev.whatap.io / api.whatap.io**.
+
+## 와탭 OAuth 및 HTTP 전환
+
+사용자 로그인 모드: **Slack → 봇 → 사용자 Bearer로 Argus `/v1/agent` → WhaTap front의 사용자 권한 조회**.
+
+- `login`으로 와탭 계정 연결, `whoami`로 계정 확인, `logout`으로 연결 해제.
+- 기본은 기존 Socket Mode. `SLACK_TRANSPORT=http`로 서명 검증 HTTP 수신을 선택할 수 있다.
+- [HTTP 배포 준비](docs/http-rollout.md): 설정, 두 OAuth 콜백, 최소 권한, 삭제 처리, 전환 순서와 운영 전제.
+- [실제 Slack DM E2E 기록](docs/e2e-2026-11-03.md): 로컬 사용자 로그인·CPU 답변·계정 확인. 운영 배포 완료를 의미하지 않는다.
+- [HTTP 준비 코드 검증](docs/http-verification-2026-11-03.md): 최종 테스트·독립 리뷰·빌드 기동 결과와 현재 실행 버전, 미배포 범위.
+- `slack-manifest.http.json`은 검토용 초안이다. `example.invalid`를 실제 승인 도메인으로 교체하고 배포를 검증한 뒤 적용한다. 현재 Slack 설정은 바꾸지 않았다.
+
+## 기존 내부 MCP/쿠키 모드 (레거시 참고)
+
+아래 설정은 사용자 OAuth를 사용하지 않는 기존 내부 경로용이다. Marketplace용 HTTP 다중 워크스페이스 모드는 이 공용 자격증명 경로로 기동하지 않는다.
+
+내부 chain: **Slack → Claude API → whatap-open-mcp-aitf MCP → Argus**.
 
 ```
 Slack workspace
@@ -14,7 +30,7 @@ Slack workspace
                                           └─ WhaTap (cookie / token)
 ```
 
-argus / whatap-mcp 는 변경 0 — 이 봇이 MCP 클라이언트로 spawn 만.
+이 레거시 경로에서 봇은 MCP 클라이언트를 spawn 한다. 새 OAuth 경로는 별도 Argus/front Bearer 지원을 필요로 한다.
 
 ## Quick start
 
@@ -143,6 +159,8 @@ argus 가 도구 응답에 `actions: [{type, label, payload}]` 박으면 봇이 
 
 ## 알려진 제약 / 후속
 
+아래 cookie 관련 항목은 레거시 모드에 한정된다. OAuth/HTTP의 미검증 배포 단계와 데이터 보관 경계는 [HTTP 배포 준비](docs/http-rollout.md)를 따른다.
+
 - **`ARGUS_COOKIE` 만료**: cookie 기반이라 며칠~수주 단위 만료. 만료시 `.env` 갱신 + 재기동.
 - **단일 cookie / 멀티 사용자**: 현재 모든 Slack 사용자가 봇의 `ARGUS_COOKIE` (한 사람 권한) 로 묶임. 사용자별 cookie 분리는 OAuth 설계 필요 (별 작업).
 - **차트 미지원**: argus 가 Vega-Lite chart spec 반환해도 Slack 에선 렌더 불가 — 텍스트 요약만 표시.
@@ -156,6 +174,10 @@ argus 가 도구 응답에 `actions: [{type, label, payload}]` 박으면 봇이 
 | 파일 | 역할 |
 |---|---|
 | `src/index.ts` | 진입점 — Bolt App + Anthropic + MCP 와이어링 + 이벤트 핸들러 |
+| `src/slack-app.ts` | Socket/HTTP 선택, 요청 서명 검증, Slack 설치 OAuth |
+| `src/whatap-oauth.ts`, `src/oauth-http.ts` | 와탭 로그인·갱신·연결 해제 |
+| `src/whatap-links.ts`, `src/installations.ts` | 사용자 연결 및 Slack 설치 정보 저장 |
+| `src/onboarding.ts` | 계정 없는 사용자 안내와 Slack 도움말 |
 | `src/mcp-client.ts` | whatap-mcp stdio child + listTools/callTool wrapper |
 | `src/claude-loop.ts` | Anthropic Messages API + tool_use 수동 루프 |
 | `src/conversation.ts` | thread → history Map + idle expire |

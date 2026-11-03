@@ -189,3 +189,40 @@ test("idle 만료 thread 는 gc 됨", () => {
     th.close();
   }
 });
+
+test("workspace-scoped history isolates identical thread IDs and deletes only one workspace", () => {
+  const th = new ThreadHistory(10, 30 * 60 * 1000, dbPath);
+  try {
+    const a = th.forWorkspace("T1");
+    const b = th.forWorkspace("T10");
+    a.appendTurn("C1:1.0#U1", [{ role: "user", content: "A" }]);
+    b.appendTurn("C1:1.0#U1", [{ role: "user", content: "B" }]);
+    a.setArgusConvId("C1:1.0#U1", "conv-a");
+    b.setArgusConvId("C1:1.0#U1", "conv-b");
+    assert.equal(a.get("C1:1.0#U1").history[0].content, "A");
+    assert.equal(b.get("C1:1.0#U1").history[0].content, "B");
+    th.deleteWorkspace("T1");
+    assert.deepEqual(th.forWorkspace("T1").get("C1:1.0#U1").history, []);
+    assert.equal(th.forWorkspace("T1").get("C1:1.0#U1").argusConversationId, undefined);
+    assert.equal(b.get("C1:1.0#U1").argusConversationId, "conv-b");
+  } finally { th.close(); }
+});
+
+test("uninstall invalidates an in-flight history view even after a new installation starts", () => {
+  const th = new ThreadHistory(10, 30 * 60 * 1000, dbPath);
+  try {
+    const inflight = th.forWorkspace("T1");
+    inflight.appendTurn("C1:1.0", [{ role: "user", content: "old question" }]);
+    th.deleteWorkspace("T1");
+    const reinstalled = th.forWorkspace("T1");
+    inflight.appendTurn("C1:1.0", [{ role: "assistant", content: "late old answer" }]);
+    inflight.setArgusConvId("C1:1.0", "late-conversation");
+    assert.deepEqual(reinstalled.get("C1:1.0").history, []);
+    assert.equal(reinstalled.get("C1:1.0").argusConversationId, undefined);
+    assert.equal(inflight.isActive(), false);
+    reinstalled.appendTurn("C1:1.0", [{ role: "user", content: "new question" }]);
+    assert.equal(reinstalled.get("C1:1.0").history[0].content, "new question");
+    assert.throws(() => inflight.get("C1:1.0"), /removed/);
+    assert.throws(() => th.deleteWorkspace(""), /workspace ID/);
+  } finally { th.close(); }
+});
