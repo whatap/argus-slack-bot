@@ -8,13 +8,24 @@
 // 해당 워크스페이스의 bot_token 을 찾아서 응답할 때 사용.
 
 import Database from "better-sqlite3";
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 // @slack/bolt re-exports these from @slack/oauth.
 import type { Installation, InstallationQuery } from "@slack/bolt";
+import { decryptToken, deriveKey, encryptToken } from "./crypto.js";
+
+export interface SlackBotIdentity {
+  botUserId: string | null;
+  installedAt: number;
+}
 
 export class SqliteInstallationStore {
   private db: Database.Database;
+  private readonly key: Buffer | null;
 
-  constructor(dbPath: string) {
+  constructor(dbPath: string, encryptionSecret?: string) {
+    this.key = encryptionSecret ? deriveKey(encryptionSecret) : null;
+    mkdirSync(dirname(dbPath), { recursive: true });
     this.db = new Database(dbPath);
     this.db.pragma("journal_mode = WAL");
     this.db.exec(`
@@ -66,10 +77,10 @@ export class SqliteInstallationStore {
         teamId,
         enterpriseId,
         botUserId,
-        botToken,
+        this.key ? encryptToken(botToken, this.key) : botToken,
         scopes,
         Date.now(),
-        JSON.stringify(installation),
+        this.key ? encryptToken(JSON.stringify(installation), this.key) : JSON.stringify(installation),
       );
   }
 
@@ -87,10 +98,17 @@ export class SqliteInstallationStore {
     if (!row) {
       throw new Error(`fetchInstallation: ${teamId} 미설치`);
     }
-    return JSON.parse(row.raw_json) as Installation<"v1" | "v2", boolean>;
+    return JSON.parse(decryptToken(row.raw_json, this.key)) as Installation<"v1" | "v2", boolean>;
   }
 
-  /** Bolt 가 app_uninstalled / tokens_revoked 시 호출. */
+  /** No credential decryption is needed to match a revocation or a stale event. */
+  getBotIdentity(teamId: string): SlackBotIdentity | null {
+    const row = this.db.prepare(`SELECT bot_user_id, installed_at FROM slack_installations WHERE team_id = ?`)
+      .get(teamId) as { bot_user_id: string | null; installed_at: number } | undefined;
+    return row ? { botUserId: row.bot_user_id, installedAt: row.installed_at } : null;
+  }
+
+  /** Explicit lifecycle listeners call this; Bolt skips authorization for these events. */
   async deleteInstallation(query: InstallationQuery<boolean>): Promise<void> {
     const teamId = query.teamId;
     if (!teamId) return;

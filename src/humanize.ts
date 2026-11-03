@@ -6,13 +6,27 @@
 // 분리한 이유: index.ts 안에 두면 unit test 어려움. 별도 파일이라
 // node --test 로 잘 테스트됨. 새 패턴 추가 시 humanize.test.ts 도 같이 갱신.
 
-export function humanizeError(err: unknown): string {
+export interface HumanizeOptions {
+  /** 와탭 로그인(OAuth) 모드. 인증 오류를 cookie/register 대신 login 으로 안내한다. */
+  whatapLogin?: boolean;
+}
+
+export function humanizeError(err: unknown, opts: HumanizeOptions = {}): string {
   const msg = err instanceof Error ? err.message : String(err);
 
   // argus /v1/chat error (status) — argusDirect 경로
   const argusHttp = msg.match(/argus \/v1\/(?:chat|agent) error \((\d{3})\)/);
   if (argusHttp) {
     const status = Number(argusHttp[1]);
+    if (opts.whatapLogin && status === 401) {
+      return (
+        ":lock: *argus 인증 실패 (401)* argus 가 와탭 로그인 토큰을 받지 않았어요.\n" +
+        "`login` 으로 다시 연결해도 같으면 운영자에게 알리세요."
+      );
+    }
+    if (opts.whatapLogin && status === 403) {
+      return ":no_entry: *argus 권한 없음 (403)* 내 와탭 계정으로는 볼 수 없는 요청이에요.";
+    }
     if (status === 401) {
       return (
         ":lock: *argus 인증 실패 (401)* — cookie 만료/미등록.\n" +

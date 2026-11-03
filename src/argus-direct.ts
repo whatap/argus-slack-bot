@@ -20,6 +20,21 @@ export interface ArgusDirectConfig {
   apiToken: string;
   /** dev.whatap.io 의 JSESSIONID — argus 가 cookie pass-through 모드 활성. */
   cookie?: string;
+  /** 와탭 로그인 access token. 있으면 /v1/agent 에 Authorization: Bearer 로만 보낸다
+   *  (cookie·X-Argus-Token 을 함께 싣지 않는다). */
+  accessToken?: string;
+}
+
+/** argus 가 SSE 시작 전에 HTTP 오류로 거절한 경우. status 로 재시도 여부를 판단한다. */
+export class ArgusHttpError extends Error {
+  constructor(
+    readonly endpoint: string,
+    readonly status: number,
+    detail: string,
+  ) {
+    super(`argus ${endpoint} error (${status}): ${detail}`);
+    this.name = "ArgusHttpError";
+  }
 }
 
 export interface ArgusProgress {
@@ -57,23 +72,39 @@ export async function askWhatapExpertDirect(
   },
   onProgress: (p: ArgusProgress) => void,
 ): Promise<AskWhatapExpertResult> {
-  // /v1/chat (브라우저용, cookie 인증) 사용 — /v1/agent 의 X-Argus-Token
+  // 와탭 로그인 경로: /v1/agent + Bearer. AgentRequest 형식(query, context.source)이고
+  // currentUrl 필드가 없어 화면 추론 결과는 싣지 않는다.
+  //
+  // 기존 경로: /v1/chat (브라우저용, cookie 인증) — /v1/agent 의 X-Argus-Token
   // 인증 layer 가 front.apm/nginx/ALB 어딘가에서 자체 검증되어 우회 어려움.
   // 봇이 사용자 cookie 를 가지고 있으니 /v1/chat 으로 호출하면 토큰 무관.
   // body field 는 ChatRequest 형식: query → message.
   // context.client="slack" — argus 가 출력 채널이 텍스트 전용임을 인지해서
   // 차트·대시보드 도구 회피 + 후속 질문에서 시각화 항목 제외.
-  const body: Record<string, unknown> = { message: params.query };
+  const bearer = cfg.accessToken;
+  const endpoint = bearer ? "/v1/agent" : "/v1/chat";
+  const body: Record<string, unknown> = bearer
+    ? { query: params.query }
+    : { message: params.query };
   if (typeof params.pcode === "number") body.pcode = params.pcode;
   if (params.conversationId) body.conversationId = params.conversationId;
-  const context: Record<string, unknown> = { client: "slack" };
-  if (params.currentUrl) context.currentUrl = params.currentUrl;
-  body.context = context;
+  if (bearer) {
+    body.context = { source: "slack-bot" };
+  } else {
+    const context: Record<string, unknown> = { client: "slack" };
+    if (params.currentUrl) context.currentUrl = params.currentUrl;
+    body.context = context;
+  }
   // /v1/chat 은 Cookie 헤더에서 직접 읽음 — body.cookie 안 씀.
+  const authHeaders: Record<string, string> = bearer
+    ? { Authorization: `Bearer ${bearer}` }
+    : cfg.cookie
+      ? { Cookie: cfg.cookie }
+      : {};
 
-  // 디버그: query 와 routing 추적.
+  // 디버그: query 와 routing 추적. 토큰·cookie 값은 남기지 않는다.
   console.log(
-    `[argus-direct/debug] endpoint=/v1/chat query="${params.query.slice(0, 200)}" pcode=${params.pcode} conv=${params.conversationId || "-"} url=${params.currentUrl || "-"} cookie_set=${!!cfg.cookie}`,
+    `[argus-direct/debug] endpoint=${endpoint} auth=${bearer ? "bearer" : cfg.cookie ? "cookie" : "none"} query="${params.query.slice(0, 200)}" pcode=${params.pcode} conv=${params.conversationId || "-"} url=${params.currentUrl || "-"}`,
   );
 
   const ctrl = new AbortController();
@@ -81,10 +112,10 @@ export async function askWhatapExpertDirect(
 
   let res: Response;
   try {
-    res = await fetch(`${cfg.url}/v1/chat`, {
+    res = await fetch(`${cfg.url}${endpoint}`, {
       method: "POST",
       headers: {
-        ...(cfg.cookie ? { Cookie: cfg.cookie } : {}),
+        ...authHeaders,
         "Content-Type": "application/json",
         Accept: "text/event-stream",
       },
@@ -99,13 +130,11 @@ export async function askWhatapExpertDirect(
   if (!res.ok) {
     clearTimeout(timer);
     const errText = await res.text().catch(() => "");
-    throw new Error(
-      `argus /v1/chat error (${res.status}): ${errText || res.statusText}`,
-    );
+    throw new ArgusHttpError(endpoint, res.status, errText || res.statusText);
   }
   if (!res.body) {
     clearTimeout(timer);
-    throw new Error("argus /v1/chat returned no body");
+    throw new Error(`argus ${endpoint} returned no body`);
   }
 
   try {

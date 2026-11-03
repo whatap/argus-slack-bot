@@ -30,6 +30,7 @@ export function landingPageHtml(): string {
       font-family: -apple-system, BlinkMacSystemFont, "SF Pro KR", "Apple SD Gothic Neo",
                    "Pretendard", "Noto Sans KR", sans-serif;
       line-height: 1.6;
+      word-break: keep-all;
       -webkit-font-smoothing: antialiased;
     }
     a { color: var(--accent); text-decoration: none; }
@@ -247,9 +248,9 @@ export function landingPageHtml(): string {
 
   <section class="hero">
     <div class="container">
-      <div class="hero-badge">✨ Slack × WhaTap × Claude</div>
+      <div class="hero-badge">Slack × WhaTap × Argus</div>
       <h1>모니터링이<br/>대화가 됩니다</h1>
-      <p>Slack 에서 자연어로 묻고, argus 가 14개 모니터링 도구를 조합해 답변. 알림·메트릭·장애 원인을 한 줄 질문으로.</p>
+      <p>내 와탭 계정으로 연결하고, 프로젝트와 지표를 Slack 에서 질문하세요. Argus 가 사용자 권한으로 조회한 결과를 정리합니다.</p>
       <div class="cta-row">
         <a class="btn-primary" href="/slack/install">
           <svg width="20" height="20" viewBox="0 0 122 122" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -276,28 +277,28 @@ export function landingPageHtml(): string {
         </div>
         <div class="feature">
           <div class="feature-icon">⚡</div>
-          <h3>14개 도구 조합</h3>
-          <p>argus 가 프로젝트 메타·MXQL·알림·토폴로지를 자동으로 연결해 한 번에 답변.</p>
+          <h3>프로젝트·지표 조회</h3>
+          <p>Argus 가 질문에 맞는 조회 도구를 선택해 프로젝트와 모니터링 지표를 확인합니다.</p>
         </div>
         <div class="feature">
           <div class="feature-icon">🔐</div>
           <h3>사용자별 권한</h3>
-          <p>각자 자기 WhaTap 토큰으로 인증. 자기 프로젝트만 보이고, 다른 사람과 격리.</p>
+          <p>브라우저에서 와탭 로그인과 동의를 거쳐 연결합니다. 조회 권한은 와탭이 확인합니다.</p>
         </div>
         <div class="feature">
           <div class="feature-icon">💬</div>
           <h3>Slack 네이티브</h3>
-          <p>채널 멘션 / DM / 스레드 follow-up 다 지원. 새 앱 설치 / 별 화면 X.</p>
+          <p>앱 설치 후 채널 멘션, DM, 스레드 후속 질문으로 사용할 수 있습니다.</p>
         </div>
         <div class="feature">
           <div class="feature-icon">🧠</div>
-          <h3>Claude opus 4.7</h3>
-          <p>Anthropic 최신 모델 + WhaTap 도메인 컨텍스트 결합. 복합 질문도 한 번에.</p>
+          <h3>Argus AI 분석</h3>
+          <p>질문과 조회 결과를 Argus 가 해석합니다. AI 답변은 부정확할 수 있으므로 중요한 판단 전 원본 데이터를 확인하세요.</p>
         </div>
         <div class="feature">
           <div class="feature-icon">🛠️</div>
-          <h3>설정 1분</h3>
-          <p>워크스페이스 install + DM 으로 토큰 register, 끝.</p>
+          <h3>브라우저 로그인</h3>
+          <p>봇 DM 에서 login 으로 계정을 연결합니다. 비밀번호나 토큰을 Slack 메시지에 붙여넣지 마세요.</p>
         </div>
       </div>
     </div>
@@ -312,12 +313,12 @@ export function landingPageHtml(): string {
           <p>위 <strong>"Add to Slack"</strong> 버튼 클릭 → 워크스페이스 선택 → Allow.</p>
         </div>
         <div class="step">
-          <h3>토큰 등록</h3>
-          <p><a href="https://service.whatap.io" target="_blank" rel="noopener">WhaTap Console</a> 에서 API 토큰 발급 → 봇한테 DM 으로 <code>register &lt;token&gt;</code>.</p>
+          <h3>와탭 계정 연결</h3>
+          <p>봇 DM 에서 <code>login</code> → 본인에게 온 링크에서 로그인·동의. 계정이 없으면 <a href="https://service.whatap.io" target="_blank" rel="noopener">WhaTap Console</a> 에서 가입하거나 조직 관리자에게 초대를 요청하세요. 프로젝트 접근 권한도 필요합니다.</p>
         </div>
         <div class="step">
           <h3>질문 시작</h3>
-          <p>채널에서 <code>@argus 무엇이든 물어봐</code> 또는 봇 DM 으로 자유롭게.</p>
+          <p>채널 멘션 또는 봇 DM 에서 질문하세요. <code>whoami</code> 로 연결 계정을 확인하고 <code>logout</code> 으로 연결을 끊을 수 있습니다.</p>
         </div>
       </div>
     </div>
@@ -327,7 +328,7 @@ export function landingPageHtml(): string {
     <div class="container">
       <div>
         <h2>이렇게 동작합니다</h2>
-        <p>실제 Slack 대화 예시. argus 가 도구를 조합해 합성 답변.</p>
+        <p>사용 흐름을 보여 주는 예시입니다. 실시간 조회 결과가 아닙니다.</p>
       </div>
       <div class="chat-mock">
         <div class="msg msg-user">@argus 3396 프로젝트의 최근 알림 보여줘</div>
@@ -344,14 +345,15 @@ export function landingPageHtml(): string {
   <section class="final-cta">
     <div class="container">
       <h2>지금 바로 시작</h2>
-      <p>1분이면 워크스페이스에 들어옵니다.</p>
+      <p>워크스페이스에 앱을 추가한 뒤, 각자 와탭 계정을 연결하세요.</p>
       <a class="btn-primary" href="/slack/install">+ Add to Slack</a>
     </div>
   </section>
 
   <footer>
     <div class="container">
-      <p>© WhaTap Labs · powered by Claude · <a href="https://whatap.io" target="_blank" rel="noopener">whatap.io</a></p>
+      <p>© WhaTap Labs · <a href="https://whatap.io" target="_blank" rel="noopener">whatap.io</a></p>
+      <p><a href="/privacy">개인정보 처리방침</a> · <a href="/terms">이용약관</a> · <a href="/support">지원</a></p>
     </div>
   </footer>
 </body>

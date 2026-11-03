@@ -1,0 +1,40 @@
+{
+  "display_information": {
+    "name": "whatap-argus",
+    "description": "Slack에서 내 와탭 모니터링 데이터를 질문하세요.",
+    "long_description": "whatap-argus는 Slack DM과 채널 멘션으로 와탭 모니터링 데이터를 질문하는 봇입니다. 설치 후 봇에 login을 보내 와탭 계정으로 로그인하고 연결 권한에 동의하세요. 각 사용자의 와탭 권한으로 프로젝트와 지표를 조회하고, Argus가 결과를 정리해 Slack에 답합니다. 후속 질문 버튼으로 같은 스레드에서 질문을 이어갈 수 있습니다. whoami로 연결 계정을 확인하고 logout으로 연결을 해제할 수 있습니다. 와탭 계정과 대상 프로젝트의 접근 권한이 필요하며, 계정이 없으면 와탭 콘솔에서 가입하거나 조직 관리자에게 초대를 요청하세요. AI가 생성한 답변은 부정확할 수 있으므로 중요한 판단 전에 원본 데이터를 확인하세요.",
+    "background_color": "#090e1a"
+  },
+  "features": {
+    "app_home": {
+      "home_tab_enabled": false,
+      "messages_tab_enabled": true,
+      "messages_tab_read_only_enabled": false
+    },
+    "bot_user": {
+      "display_name": "whatap-argus",
+      "always_online": true
+    }
+  },
+  "oauth_config": {
+    "redirect_urls": ["https://slack-bot.example.invalid/slack/oauth_redirect"],
+    "scopes": {
+      "bot": ["app_mentions:read", "chat:write", "im:history"]
+    }
+  },
+  "settings": {
+    "event_subscriptions": {
+      "request_url": "https://slack-bot.example.invalid/slack/events",
+      "bot_events": ["app_mention", "message.im", "app_uninstalled", "tokens_revoked"]
+    },
+    "interactivity": {
+      "is_enabled": true,
+      "request_url": "https://slack-bot.example.invalid/slack/events"
+    },
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": false,
+    "is_mcp_enabled": false,
+    "token_rotation_enabled": false,
+    "app_level_token_rotation_enabled": false
+  }
+}

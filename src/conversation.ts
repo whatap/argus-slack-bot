@@ -42,6 +42,7 @@ function isOrphanFirstMessage(m: MessageParam): boolean {
 
 export class ThreadHistory {
   private db: Database.Database;
+  private readonly workspaceGenerations = new Map<string, number>();
 
   constructor(
     /** thread 당 보관할 최대 turn 수. 초과 시 오래된 turn 부터 drop. */
@@ -70,6 +71,37 @@ export class ThreadHistory {
       CREATE INDEX IF NOT EXISTS idx_thread_meta_touched
         ON thread_meta(last_touched_at);
     `);
+  }
+
+  /** team 별 키와 삭제 세대를 고정한다. 삭제 전에 시작한 응답은 기록을 되살리지 못한다. */
+  forWorkspace(teamId: string) {
+    if (!/^T[A-Z0-9]+$/.test(teamId)) throw new Error("history requires a Slack workspace ID");
+    const prefix = `${teamId}:`;
+    const generation = this.workspaceGenerations.get(teamId) ?? 0;
+    const isActive = () => generation === (this.workspaceGenerations.get(teamId) ?? 0);
+    return {
+      isActive,
+      get: (threadKey: string) => {
+        if (!isActive()) throw new Error("workspace was removed during this request");
+        return this.get(prefix + threadKey);
+      },
+      appendTurn: (threadKey: string, msgs: MessageParam[]) => {
+        if (isActive()) this.appendTurn(prefix + threadKey, msgs);
+      },
+      setArgusConvId: (threadKey: string, id: string) => {
+        if (isActive()) this.setArgusConvId(prefix + threadKey, id);
+      },
+    };
+  }
+
+  deleteWorkspace(teamId: string): void {
+    if (!/^T[A-Z0-9]+$/.test(teamId)) throw new Error("history requires a Slack workspace ID");
+    this.workspaceGenerations.set(teamId, (this.workspaceGenerations.get(teamId) ?? 0) + 1);
+    const prefix = `${teamId}:`;
+    this.db.transaction(() => {
+      this.db.prepare("DELETE FROM thread_history WHERE substr(thread_key, 1, ?) = ?").run(prefix.length, prefix);
+      this.db.prepare("DELETE FROM thread_meta WHERE substr(thread_key, 1, ?) = ?").run(prefix.length, prefix);
+    })();
   }
 
   get(threadKey: string): ThreadState {

@@ -1,7 +1,7 @@
 // src/index.ts
 //
 // argus-slack-bot 진입점.
-// Slack Bolt App (Socket Mode) + Anthropic + whatap-mcp 셋 와이어링.
+// Slack Bolt App (Socket / HTTP) + 사용자 OAuth Argus 직접 호출, legacy MCP 경로.
 //
 // 동작 (multi-tenant):
 //   1. 부팅 시 SQLite (slack_user_id → WhaTap creds) 오픈.
@@ -19,9 +19,9 @@ import { config as dotenvConfig } from "dotenv";
 dotenvConfig({ override: true });
 
 import Anthropic from "@anthropic-ai/sdk";
-import bolt from "@slack/bolt";
+import http from "node:http";
 
-import { describeArgusSubTool } from "./argus-direct.js";
+import { describeArgusSubTool, type ArgusDirectConfig } from "./argus-direct.js";
 import { runClaudeWithMcp, type ToolCallEntry } from "./claude-loop.js";
 import { ThreadHistory } from "./conversation.js";
 import { runDirectToArgus, type DirectRouteSnap } from "./direct-route.js";
@@ -29,12 +29,26 @@ import { humanizeError } from "./humanize.js";
 import { inferCurrentUrl } from "./screen-infer.js";
 import { SqliteInstallationStore } from "./installations.js";
 import { landingPageHtml } from "./landing.js";
-import { privacyPageHtml, termsPageHtml } from "./legal.js";
+import { privacyPageHtml, termsPageHtml, supportPageHtml } from "./legal.js";
 import { McpClientPool } from "./mcp-pool.js";
+import {
+  PendingLogins,
+  createOAuthHttpHandler,
+  loginStartUrl,
+} from "./oauth-http.js";
 import { splitForSlack, toSlackMrkdwn } from "./slack-format.js";
+import { createSlackApp, loadSlackSettings } from "./slack-app.js";
+import { createSlackLifecycleHandlers } from "./slack-lifecycle.js";
+import { ACCOUNT_SETUP_GUIDANCE, WHATAP_LOGIN_HELP } from "./onboarding.js";
 import { UserTokenStore, maskToken, type UserCreds } from "./user-tokens.js";
-
-const { App, LogLevel } = bolt;
+import { WhatapLinkStore } from "./whatap-links.js";
+import {
+  LoginRequiredError,
+  WhatapOAuthClient,
+  WhatapTokenManager,
+  loadWhatapOAuthSettings,
+  type WhatapOAuthSettings,
+} from "./whatap-oauth.js";
 
 // ── 환경변수 검사 ─────────────────────────────────────────────
 function requireEnv(name: string): string {
@@ -46,34 +60,8 @@ function requireEnv(name: string): string {
   return v;
 }
 
-const SLACK_APP_TOKEN = requireEnv("SLACK_APP_TOKEN");
-const ANTHROPIC_API_KEY = requireEnv("ANTHROPIC_API_KEY");
-const WHATAP_MCP_PATH = requireEnv("WHATAP_MCP_PATH");
-
-// Multi-workspace OAuth — 셋 다 있으면 multi-workspace 모드. 아니면 single-workspace
-// (SLACK_BOT_TOKEN 으로 폴백). 시연/내부용엔 single, 외부 배포엔 multi.
-const SLACK_CLIENT_ID = process.env.SLACK_CLIENT_ID || "";
-const SLACK_CLIENT_SECRET = process.env.SLACK_CLIENT_SECRET || "";
-const SLACK_SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET || "";
-const SLACK_STATE_SECRET = process.env.SLACK_STATE_SECRET || "";
-const SLACK_OAUTH_PORT = Number(process.env.SLACK_OAUTH_PORT || 3000);
-const IS_MULTI_WORKSPACE = !!(
-  SLACK_CLIENT_ID &&
-  SLACK_CLIENT_SECRET &&
-  SLACK_SIGNING_SECRET &&
-  SLACK_STATE_SECRET
-);
-
-// Single-workspace 폴백 토큰. multi-workspace 모드면 미사용.
-const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN || "";
-if (!IS_MULTI_WORKSPACE && !SLACK_BOT_TOKEN) {
-  console.error(
-    "[argus-slack-bot] Slack 인증 미설정.\n" +
-      "  • single-workspace: SLACK_BOT_TOKEN 필수\n" +
-      "  • multi-workspace : SLACK_CLIENT_ID + SLACK_CLIENT_SECRET + SLACK_SIGNING_SECRET + SLACK_STATE_SECRET",
-  );
-  process.exit(1);
-}
+const SLACK_SETTINGS = loadSlackSettings(process.env);
+const IS_MULTI_WORKSPACE = SLACK_SETTINGS.multiWorkspace;
 
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-opus-4-7";
 const ANTHROPIC_MAX_TOKENS = Number(process.env.ANTHROPIC_MAX_TOKENS || 8192);
@@ -106,15 +94,33 @@ const DEFAULT_WHATAP_API_URL =
 const ARGUS_URL = process.env.ARGUS_URL || "";
 const ARGUS_API_TOKEN = process.env.ARGUS_API_TOKEN || "";
 
+// 와탭 로그인(OAuth) 모드. WHATAP_OAUTH_ISSUER·CLIENT_ID·CLIENT_SECRET·REDIRECT_URI 가
+// 모두 있으면 켠다. 사용자는 Slack 에서 login 으로 와탭 계정을 연결하고, 질문은 그 사용자
+// 토큰으로 argus /v1/agent 에 Bearer 로 간다 (cookie·X-Argus-Token·기본 토큰 폴백 없음).
+// 일부만 있으면 조용히 기존 방식으로 떨어지지 않게 시작하지 않는다.
+let WHATAP_LOGIN: WhatapOAuthSettings | null = null;
+try {
+  WHATAP_LOGIN = loadWhatapOAuthSettings(process.env);
+  if (SLACK_SETTINGS.transport === "http" && IS_MULTI_WORKSPACE && !WHATAP_LOGIN) {
+    throw new Error("공개 HTTP 다중 워크스페이스 모드에는 와탭 OAuth 설정이 필요해요");
+  }
+} catch (err) {
+  console.error(`[argus-slack-bot] ${err instanceof Error ? err.message : String(err)}`);
+  process.exit(1);
+}
+
 // Slack App ID — OAuth 콜백 성공 시 사용자를 자기 Slack workspace 로 다시
 // 보내는 deep link 에 박힘 (slack.com/app_redirect?app=<id>&team=<team>).
 // App Directory 등재 검증 요구사항 — Redirect URL 이 200 HTML 페이지가 아니라
 // slack.com 으로 302 해야 함. App ID 는 api.slack.com/apps/<ID> 의 ID 부분.
-const SLACK_APP_ID = process.env.SLACK_APP_ID || "A0AFUKNJ5SS";
+const SLACK_APP_ID = SLACK_SETTINGS.appId;
+// 사용자 OAuth 직접 경로에는 외곽 LLM/MCP 자격증명이 필요 없다.
+const ANTHROPIC_API_KEY = WHATAP_LOGIN ? "" : requireEnv("ANTHROPIC_API_KEY");
+const WHATAP_MCP_PATH = WHATAP_LOGIN ? "" : requireEnv("WHATAP_MCP_PATH");
 
-// 부팅 시 즉시 디버그 로그 — 401 진단용. 토큰 전체 X, prefix + length 만.
+// 설정 유무만 기록한다. 토큰 prefix 도 로그에 남기지 않는다.
 console.log(
-  `[argus-slack-bot/debug] ARGUS_URL=${ARGUS_URL || "<empty>"} ARGUS_API_TOKEN_set=${!!ARGUS_API_TOKEN} prefix=${ARGUS_API_TOKEN.slice(0, 8)}... length=${ARGUS_API_TOKEN.length}`,
+  `[argus-slack-bot/debug] ARGUS_URL=${ARGUS_URL || "<empty>"} ARGUS_API_TOKEN_set=${!!ARGUS_API_TOKEN}`,
 );
 
 // Default fallback creds — 사용자가 register 안 했을 때 대신 사용.
@@ -164,12 +170,17 @@ const SYSTEM_PROMPT = `당신은 WhaTap 의 도메인 전문가 봇입니다. �
 
 // ── 명령 파싱 ────────────────────────────────────────────────
 interface ParsedCommand {
-  kind: "register" | "cookie" | "whoami" | "logout" | "help";
+  kind: "register" | "cookie" | "whoami" | "logout" | "help" | "login";
   value?: string;
 }
 
-function parseCommand(text: string): ParsedCommand | null {
+function parseCommand(text: string, whatapLogin = false): ParsedCommand | null {
   const trimmed = text.trim();
+  // login 은 와탭 로그인 모드에서, 메시지 전체가 login 일 때만 명령으로 본다
+  // ("login 실패율 보여줘" 같은 질문을 가로채지 않게).
+  if (whatapLogin && /^(login|로그인)$/i.test(trimmed)) {
+    return { kind: "login" };
+  }
   // 첫 단어 + rest. command 는 case-insensitive.
   const firstSpace = trimmed.search(/\s/);
   const head =
@@ -208,6 +219,7 @@ const HELP_MESSAGE = [
   "토큰 발급: WhaTap Console → 계정 설정 → API Token",
 ].join("\n");
 
+
 // ── 부팅 ──────────────────────────────────────────────────────
 async function main() {
   console.log("[argus-slack-bot] starting...");
@@ -218,7 +230,7 @@ async function main() {
     TOKENS_ENCRYPTION_KEY || undefined,
   );
   const installationStore = IS_MULTI_WORKSPACE
-    ? new SqliteInstallationStore(INSTALLATIONS_DB)
+    ? new SqliteInstallationStore(INSTALLATIONS_DB, TOKENS_ENCRYPTION_KEY || undefined)
     : null;
   console.log(
     `[argus-slack-bot] token DB: ${USER_TOKENS_DB} encryption: ${
@@ -227,14 +239,14 @@ async function main() {
   );
   if (installationStore) {
     console.log(
-      `[argus-slack-bot] mode=multi-workspace installations=${installationStore.count()} oauth-port=${SLACK_OAUTH_PORT}`,
+      `[argus-slack-bot] mode=multi-workspace installations=${installationStore.count()} oauth-port=${SLACK_SETTINGS.port}`,
     );
   } else {
     console.log("[argus-slack-bot] mode=single-workspace (SLACK_BOT_TOKEN)");
   }
 
   // 2) Anthropic + thread history (SQLite-backed, 봇 재시작 후에도 thread 유지)
-  const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+  const anthropic = WHATAP_LOGIN ? undefined : new Anthropic({ apiKey: ANTHROPIC_API_KEY });
   const threadHistory = new ThreadHistory(
     MAX_HISTORY_TURNS,
     30 * 60 * 1000,
@@ -247,93 +259,72 @@ async function main() {
   const mcpPool = new McpClientPool(WHATAP_MCP_PATH);
   console.log("[argus-slack-bot] mcp pool: keep-warm enabled (idle=5min)");
 
-  // 3) Slack Bolt App
-  // - single-workspace: token 직접 주입
-  // - multi-workspace: installationStore + clientId/secret/signingSecret/stateSecret
-  //   Bolt 가 OAuth 콜백용 HTTP server 도 같이 띄움 (port=SLACK_OAUTH_PORT).
-  //   Socket Mode 는 그대로 — appToken 으로 모든 워크스페이스 이벤트 수신, 응답 시
-  //   installationStore 로 해당 team_id 의 bot_token 을 자동 lookup.
-  const SLACK_SCOPES = [
-    "app_mentions:read",
-    "chat:write",
-    "im:history",
-    "im:read",
-    "im:write",
-  ];
-  const app = IS_MULTI_WORKSPACE
-    ? new App({
-        appToken: SLACK_APP_TOKEN,
-        socketMode: true,
-        clientId: SLACK_CLIENT_ID,
-        clientSecret: SLACK_CLIENT_SECRET,
-        signingSecret: SLACK_SIGNING_SECRET,
-        stateSecret: SLACK_STATE_SECRET,
-        scopes: SLACK_SCOPES,
-        installationStore: installationStore!,
-        installerOptions: {
-          port: SLACK_OAUTH_PORT,
-          // 기본 path: /slack/install (시작), /slack/oauth_redirect (콜백)
-          // directInstall=true → /slack/install 가 HTML 페이지 안 보여주고
-          // 바로 slack.com/oauth/v2/authorize 로 302. Slack Marketplace 의
-          // "Direct install URL" 흐름과 매칭.
-          directInstall: true,
-          // App Directory 등재 요구사항 — 콜백 성공 시 slack.com 으로 302 redirect
-          // (사용자 자기 workspace 로 자동 복귀). default 는 success HTML 페이지 200
-          // 인데 Slack 검증이 "redirect URL must return 302 to slack.com" 으로 거부.
-          callbackOptions: {
-            success: (installation, _installOptions, _req, res) => {
-              const teamId = installation?.team?.id || "";
-              const location = `https://slack.com/app_redirect?app=${SLACK_APP_ID}${teamId ? `&team=${teamId}` : ""}`;
-              res.writeHead(302, { Location: location });
-              res.end();
-            },
-            // failure 케이스 (state 미스매치 / invalid code 등) 도 302 to slack.com.
-            // Slack App Directory 검증이 redirect URL 의 응답을 자동 테스트할 때
-            // fake code 보낼 수 있어 — 그 응답도 302 to slack.com 이어야 검증 통과.
-            failure: (_error, _installOptions, _req, res) => {
-              res.writeHead(302, {
-                Location: `https://slack.com/app_redirect?app=${SLACK_APP_ID}`,
-              });
-              res.end();
-            },
-          },
-        },
-        // root 에 마케팅 랜딩 페이지 — QR / 데모용.
-        // /privacy + /terms — Slack App Directory submit 시 Privacy / ToS URL 박힘.
-        customRoutes: [
-          {
-            path: "/",
-            method: ["GET"],
-            handler: (_req, res) => {
-              res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-              res.end(landingPageHtml());
-            },
-          },
-          {
-            path: "/privacy",
-            method: ["GET"],
-            handler: (_req, res) => {
-              res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-              res.end(privacyPageHtml());
-            },
-          },
-          {
-            path: "/terms",
-            method: ["GET"],
-            handler: (_req, res) => {
-              res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-              res.end(termsPageHtml());
-            },
-          },
-        ],
-        logLevel: LogLevel.INFO,
-      })
-    : new App({
-        token: SLACK_BOT_TOKEN,
-        appToken: SLACK_APP_TOKEN,
-        socketMode: true,
-        logLevel: LogLevel.INFO,
-      });
+  // 와탭 로그인 모드 — 연결 저장소(암호화 필수) + /oauth/start·/oauth/callback 리스너.
+  let whatapLogin: WhatapLoginRuntime | null = null;
+  let oauthServer: http.Server | null = null;
+  // Single-workspace admission stays closed until auth.test verifies identity.
+  let singleWorkspace: { teamId: string; botUserId: string } | undefined;
+  const isWorkspaceActive = (teamId: string): boolean => installationStore
+    ? installationStore.getBotIdentity(teamId) !== null
+    : singleWorkspace?.teamId === teamId;
+  if (WHATAP_LOGIN) {
+    const store = new WhatapLinkStore(USER_TOKENS_DB, TOKENS_ENCRYPTION_KEY);
+    const oauthClient = new WhatapOAuthClient(WHATAP_LOGIN.oauth);
+    const pending = new PendingLogins({ isWorkspaceActive });
+    whatapLogin = {
+      settings: WHATAP_LOGIN,
+      store,
+      pending,
+      manager: new WhatapTokenManager(store, oauthClient),
+    };
+    oauthServer = http.createServer(
+      createOAuthHttpHandler({ client: oauthClient, store, pending, slackAppId: SLACK_APP_ID }),
+    );
+    const { listenHost, listenPort } = WHATAP_LOGIN;
+    await new Promise<void>((resolve, reject) => {
+      oauthServer!.once("error", reject);
+      oauthServer!.listen(listenPort, listenHost, () => resolve());
+    });
+    console.log(
+      `[argus-slack-bot] whatap login enabled: issuer=${WHATAP_LOGIN.oauth.issuer} client=${WHATAP_LOGIN.oauth.clientId} callback=${WHATAP_LOGIN.oauth.redirectUri} listen=${listenHost}:${listenPort} argus=${ARGUS_URL}/v1/agent`,
+    );
+  }
+
+  // 3) 같은 핸들러를 Socket 또는 서명 검증 HTTP receiver 에 연결한다.
+  const app = createSlackApp(SLACK_SETTINGS, {
+    installationStore: installationStore ?? undefined,
+    customRoutes: [
+      { path: "/", render: landingPageHtml },
+      { path: "/privacy", render: privacyPageHtml },
+      { path: "/terms", render: termsPageHtml },
+      { path: "/support", render: supportPageHtml },
+    ].map(({ path, render }) => ({
+      path,
+      method: ["GET"],
+      handler: (_req, res) => {
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(render());
+      },
+    })),
+  });
+
+  // 삭제 이벤트는 Bolt authorize 를 건너뛴다. 단일 workspace 의 신원은 미리 검증한다.
+  if (!IS_MULTI_WORKSPACE) {
+    const identity = await app.client.auth.test({ token: SLACK_SETTINGS.botToken });
+    if (!identity.team_id || !identity.user_id) throw new Error("Slack bot workspace identity is missing");
+    singleWorkspace = { teamId: identity.team_id, botUserId: identity.user_id };
+  }
+  const lifecycle = createSlackLifecycleHandlers({
+    installationStore,
+    whatap: whatapLogin,
+    singleWorkspace,
+    onWorkspaceDeleted: (teamId) => {
+      if (singleWorkspace?.teamId === teamId) singleWorkspace = undefined;
+      threadHistory.deleteWorkspace(teamId);
+    },
+  });
+  app.event("app_uninstalled", lifecycle.appUninstalled);
+  app.event("tokens_revoked", lifecycle.tokensRevoked);
 
   // 메시지 핸들러 — app_mention / DM 둘 다.
   // client = event 컨텍스트의 워크스페이스별 WebClient (multi-workspace 에선
@@ -341,6 +332,8 @@ async function main() {
   const handle = async (params: {
     text: string;
     userId: string;
+    /** Slack workspace(team) id. 와탭 로그인 연결은 team + user 로 구분한다. */
+    teamId: string;
     isDm: boolean;
     threadKey: string;
     say: (args: { text: string; thread_ts?: string; blocks?: unknown[] }) => Promise<unknown>;
@@ -354,18 +347,46 @@ async function main() {
           text: string;
           blocks?: unknown[];
         }) => Promise<unknown>;
+        postEphemeral: (args: {
+          channel: string;
+          user: string;
+          text: string;
+          thread_ts?: string;
+        }) => Promise<unknown>;
       };
     };
     // undefined 면 main DM 흐름에 답함 (새 DM 메시지). string 이면 그 thread 안 reply
     // (채널 멘션 또는 사용자가 명시적으로 thread 안에서 보낸 케이스).
     threadTs?: string;
+    /** A followup captures this before ACK, not after its asynchronous notice. */
+    history?: ReturnType<ThreadHistory["forWorkspace"]>;
   }) => {
-    const { text, userId, isDm, threadKey, say, client, threadTs } = params;
+    const { text, userId, teamId, isDm, threadKey, say, client, threadTs } = params;
     if (!text) return;
+    if (!/^T[A-Z0-9]+$/.test(teamId) || !userId) {
+      console.warn("[argus-slack-bot] ignored event without workspace/user identity");
+      return;
+    }
+    const history = params.history ?? threadHistory.forWorkspace(teamId);
+    if (!history.isActive() || !isWorkspaceActive(teamId)) return;
+    // 로그인 링크·계정 정보처럼 본인만 봐야 하는 답을 보낼 곳 (DM 이면 DM, 채널이면 ephemeral).
+    const privateCtx: PrivateReplyContext = {
+      teamId,
+      userId,
+      isDm,
+      channel: getChannelFromThreadKey(threadKey),
+      threadTs,
+      say,
+      client,
+    };
 
-    // ── 명령 처리 (register/cookie/whoami/logout/help) ─────
-    const cmd = parseCommand(text);
+    // ── 명령 처리 (register/cookie/whoami/logout/help, 와탭 로그인 모드는 login 포함) ─
+    const cmd = parseCommand(text, !!whatapLogin);
     if (cmd) {
+      if (whatapLogin) {
+        await handleWhatapLoginCommand(cmd, whatapLogin, privateCtx);
+        return;
+      }
       await handleCommand(cmd, {
         userId,
         isDm,
@@ -376,23 +397,45 @@ async function main() {
       return;
     }
 
-    // ── 사용자 creds 룩업 (없으면 default 폴백) ─────────────
-    const resolved = resolveUserCreds(userId, tokenStore);
-    if (!resolved) {
-      await say({
-        text:
-          ":lock: 등록된 토큰이 없어요. DM 으로 `register <whatap-api-token>` 보내주세요.\n" +
-          "사용법: `help`",
-        thread_ts: threadTs,
-      });
-      return;
+    // ── 자격 확인 ───────────────────────────────────────────
+    // 와탭 로그인 모드: 연결된 와탭 계정이 있어야 한다 (기본 토큰 폴백 없음). 토큰이 곧
+    // 만료되면 여기서 미리 갱신된다.
+    // 기존 모드: 사용자 creds 룩업 (없으면 default 폴백).
+    let creds: UserCreds | undefined;
+    if (whatapLogin) {
+      try {
+        await whatapLogin.manager.accessToken(teamId, userId);
+      } catch (err) {
+        if (!history.isActive()) return;
+        if (err instanceof LoginRequiredError) {
+          await sendWhatapLoginLink(whatapLogin, privateCtx);
+          return;
+        }
+        console.error(`[argus-slack-bot] whatap token refresh failed user=${userId}:`, err);
+        await say({
+          text: ":warning: 와탭 로그인 서버에 닿지 않아 토큰을 갱신하지 못했어요. 잠시 후 다시 질문하세요.",
+          thread_ts: threadTs,
+        });
+        return;
+      }
+    } else {
+      const resolved = resolveUserCreds(userId, tokenStore);
+      if (!resolved) {
+        await say({
+          text:
+            ":lock: 등록된 토큰이 없어요. DM 으로 `register <whatap-api-token>` 보내주세요.\n" +
+            "사용법: `help`",
+          thread_ts: threadTs,
+        });
+        return;
+      }
+      creds = resolved.creds;
+      if (resolved.usingDefault) {
+        console.log(`[argus-slack-bot] user=${userId} using default creds`);
+      }
     }
-    const { creds, usingDefault } = resolved;
-    if (usingDefault) {
-      console.log(`[argus-slack-bot] user=${userId} using default creds`);
-    }
-    void usingDefault; // 향후 응답 끝에 "데모 토큰 사용 중" 안내 hint 시 사용
 
+    if (!history.isActive()) return;
     // ── 로딩 placeholder ────────────────────────────────────
     let placeholderTs: string | undefined;
     try {
@@ -408,12 +451,14 @@ async function main() {
     // ── argusDirect 설정 — 정상 케이스의 진입점 ─────────────
     // 봇 외곽 Claude tool_use loop 우회 (5-10초 절감, whatap-front 와 같은 흐름).
     // 미설정 (ARGUS_URL/TOKEN 빈) 시에만 legacy MCP+claude-loop fallback.
-    const argusDirect =
-      ARGUS_URL && ARGUS_API_TOKEN
+    // 와탭 로그인 모드는 항상 direct — access token 은 호출 직전에 manager 가 채운다.
+    const argusDirect: ArgusDirectConfig | undefined = whatapLogin
+      ? { url: ARGUS_URL, apiToken: "" }
+      : ARGUS_URL && ARGUS_API_TOKEN
         ? {
             url: ARGUS_URL,
             apiToken: ARGUS_API_TOKEN,
-            cookie: creds.argusCookie,
+            cookie: creds?.argusCookie,
           }
         : undefined;
 
@@ -424,6 +469,7 @@ async function main() {
     let lastUpdateAt = 0;
     let lastSentText = "";
     const flushUpdate = async (display: string) => {
+      if (!history.isActive()) return;
       if (!placeholderTs) return;
       if (display === lastSentText) return;
       lastSentText = display;
@@ -445,7 +491,11 @@ async function main() {
     let result;
     let mcpClient: Awaited<ReturnType<typeof mcpPool.acquire>> | null = null;
     const t0 = Date.now();
-    const state = threadHistory.get(threadKey);
+    // 와탭 로그인 모드에선 argus 대화가 사용자 소유라(다른 사용자의 conversationId 는
+    // argus 가 NOT_FOUND 로 거절) 채널 thread 안에서도 사용자별로 이어 간다.
+    const convKey = whatapLogin ? `${threadKey}#${userId}` : threadKey;
+    if (!history.isActive()) return;
+    const state = history.get(convKey);
 
     try {
       if (argusDirect) {
@@ -453,30 +503,40 @@ async function main() {
         // 사용자 메시지에서 화면 의도 + pcode 추론 → 가짜 currentUrl 박음.
         // argus 의 screens.Lookup() 이 매칭 → cpm.yaml 의 domain_knowledge /
         // analysis_guides / data_registry inject. whatap-front 패널과 같은 효과.
+        // (와탭 로그인 모드의 /v1/agent 는 currentUrl 을 받지 않아 pcode 만 쓰인다.)
         const inferred = inferCurrentUrl(text);
         if (inferred) {
           console.log(
             `[argus-slack-bot] screen inferred: ${inferred.currentUrl}`,
           );
         }
-        result = await runDirectToArgus(
-          {
-            argusDirect,
-            argusConversationId: state.argusConversationId,
-            onProgress: (snap) => {
-              const now = Date.now();
-              if (now - lastUpdateAt < STREAM_INTERVAL_MS) return;
-              lastUpdateAt = now;
-              void flushUpdate(composeStepStreamingBody(snap));
+        const askArgus = (cfg: ArgusDirectConfig) =>
+          runDirectToArgus(
+            {
+              argusDirect: cfg,
+              argusConversationId: state.argusConversationId,
+              onProgress: (snap) => {
+                const now = Date.now();
+                if (now - lastUpdateAt < STREAM_INTERVAL_MS) return;
+                lastUpdateAt = now;
+                void flushUpdate(composeStepStreamingBody(snap));
+              },
             },
-          },
-          text,
-          inferred?.pcode,
-          inferred?.currentUrl,
-        );
+            text,
+            inferred?.pcode,
+            inferred?.currentUrl,
+          );
+        // 와탭 로그인 모드: argus 가 401 이면 토큰을 한 번 갱신해 다시 묻는다.
+        result = whatapLogin
+          ? await whatapLogin.manager.withAccessToken(teamId, userId, (accessToken) =>
+              askArgus({ ...argusDirect, accessToken }),
+            )
+          : await askArgus(argusDirect);
       } else {
         // legacy fallback: argusDirect 미설정 (배포 환경에서만 발생).
         // MCP child 풀에서 acquire + 외곽 LLM tool_use loop.
+        // (와탭 로그인 모드는 argusDirect 가 항상 있어 여기 오지 않는다.)
+        if (!creds || !anthropic) throw new Error("legacy MCP route requires user creds and LLM configuration");
         const mcpEnv = buildMcpEnv(creds);
         mcpClient = await mcpPool.acquire(userId, mcpEnv);
         result = await runClaudeWithMcp(
@@ -505,14 +565,15 @@ async function main() {
           state.history,
         );
       }
+      if (!history.isActive()) return;
       const dur = Date.now() - t0;
       console.log(
         `[argus-slack-bot] user=${userId} thread=${threadKey} hops=${result.hops} dur=${dur}ms text_len=${result.text.length}`,
       );
 
-      threadHistory.appendTurn(threadKey, result.newMessages);
+      history.appendTurn(convKey, result.newMessages);
       if (result.argusConversationId) {
-        threadHistory.setArgusConvId(threadKey, result.argusConversationId);
+        history.setArgusConvId(convKey, result.argusConversationId);
       }
 
       // 인사 trigger 면 chip fallback — argus 가 첫 인사에 recommendedQuestions
@@ -521,7 +582,9 @@ async function main() {
       const isGreeting = isGreetingTrigger(text);
       const formattedText = stripArgusBranding(toSlackMrkdwn(result.text || "_(빈 응답)_"));
       const toolFooter = renderToolFooter(result.toolCallLog);
-      const cookieHint = renderCookieGateHint(result.chipActions, creds);
+      // 적용/취소 chip 은 argus cookie 인증이 필요해 와탭 로그인 모드에선 띄우지 않는다
+      // (cookie 등록 안내도 하지 않는다).
+      const cookieHint = creds ? renderCookieGateHint(result.chipActions, creds) : "";
       const formatted = [formattedText, cookieHint, toolFooter]
         .filter(Boolean)
         .join("\n\n");
@@ -530,7 +593,7 @@ async function main() {
       // chip actions (event-rule / flex-event 적용 / 취소) 가 있으면 마지막 chunk
       // 에 Block Kit button 으로 동봉. 클릭 시 app.action(action_id) 핸들러가
       // argus /v1/event-rules/apply 또는 /cancel 호출.
-      const chipBlocks = chipActionsToBlocks(result.chipActions, creds);
+      const chipBlocks = creds ? chipActionsToBlocks(result.chipActions, creds) : [];
       // 추천 후속 질문 → Block Kit button. 클릭 시 같은 thread 의 새 turn.
       // argus 가 발급 안 한 경우 항상 fallback (연우 피드백: 매 응답 chip 3개).
       // greeting 일 때는 더 풍부한 5개, 일반 turn 은 3개.
@@ -582,11 +645,19 @@ async function main() {
         });
       }
     } catch (err) {
+      if (!history.isActive()) return;
       console.error(
         `[argus-slack-bot] error user=${userId} thread=${threadKey}:`,
         err,
       );
-      const errText = humanizeError(err);
+      let errText = humanizeError(err, { whatapLogin: !!whatapLogin });
+      if (whatapLogin && err instanceof LoginRequiredError) {
+        // 질문 도중 refresh 가 거절된 경우 (연결된 앱에서 끊음 등).
+        errText = ":lock: 와탭 로그인이 만료됐어요. 다시 연결할 링크를 나에게만 보이게 보냈어요.";
+        await sendWhatapLoginLink(whatapLogin, privateCtx).catch((e) =>
+          console.warn(`[argus-slack-bot] login link send failed: ${String(e)}`),
+        );
+      }
       if (placeholderTs) {
         try {
           await client.chat.update({
@@ -608,7 +679,7 @@ async function main() {
     }
   };
 
-  app.event("app_mention", async ({ event, say, client }) => {
+  app.event("app_mention", async ({ event, say, client, body }) => {
     const channel = event.channel;
     const threadTs = event.thread_ts ?? event.ts;
     const threadKey = `${channel}:${threadTs}`;
@@ -616,6 +687,7 @@ async function main() {
     await handle({
       text: cleanText,
       userId: event.user ?? "",
+      teamId: (body as { team_id?: string }).team_id ?? "",
       isDm: false,
       threadKey,
       threadTs,
@@ -626,7 +698,7 @@ async function main() {
     });
   });
 
-  app.message(async ({ message, say, client }) => {
+  app.message(async ({ message, say, client, body }) => {
     const m = message as unknown as Record<string, unknown>;
     if (m.channel_type !== "im") return;
     if (m.subtype) return;
@@ -643,6 +715,7 @@ async function main() {
     await handle({
       text,
       userId: String(m.user ?? ""),
+      teamId: (body as { team_id?: string }).team_id ?? "",
       isDm: true,
       threadKey,
       threadTs: replyThreadTs,
@@ -675,6 +748,18 @@ async function main() {
     if (!m) return;
     const op = m[1] as "apply" | "cancel";
     const token = m[2];
+
+    // Historical messages still carry these buttons. OAuth never authorizes
+    // the legacy cookie API, even when shared/default credentials remain set.
+    if (whatapLogin) {
+      await client.chat.postEphemeral({
+        channel,
+        user: userId,
+        text: ":lock: 이전 적용/취소 버튼은 와탭 로그인 모드에서 사용할 수 없어요. 새 질문으로 다시 확인해 주세요.",
+        thread_ts: threadTs,
+      });
+      return;
+    }
 
     if (!ARGUS_URL) {
       await client.chat.postEphemeral({
@@ -775,7 +860,14 @@ async function main() {
   // 것처럼 동작.
   app.action(/^followup_question:.+$/, async (ctx) => {
     const { ack, body, client, action } = ctx;
+    const teamId =
+      (body as { team?: { id?: string } }).team?.id ||
+      (body as { user?: { team_id?: string } }).user?.team_id || "";
+    // Capture deletion generation before the FIRST await, including ACK.
+    const history = /^T[A-Z0-9]+$/.test(teamId) && isWorkspaceActive(teamId)
+      ? threadHistory.forWorkspace(teamId) : undefined;
     await ack();
+    if (!history?.isActive() || !isWorkspaceActive(teamId)) return;
 
     const userId = (body as { user?: { id?: string } }).user?.id || "";
     const channel =
@@ -802,6 +894,8 @@ async function main() {
     await handle({
       text: question,
       userId,
+      teamId,
+      history,
       isDm: false,
       threadKey,
       threadTs,
@@ -818,18 +912,21 @@ async function main() {
     });
   });
 
-  await app.start();
+  if (SLACK_SETTINGS.transport === "http") {
+    await app.start({ port: SLACK_SETTINGS.port, host: SLACK_SETTINGS.listenHost });
+    console.log(`[argus-slack-bot] listening (HTTP) http://${SLACK_SETTINGS.listenHost}:${SLACK_SETTINGS.port}/slack/events`);
+  } else {
+    await app.start();
+    console.log("[argus-slack-bot] connected (Socket Mode). DM me 'help' 또는 채널에서 @argus 멘션.");
+  }
   if (IS_MULTI_WORKSPACE) {
     console.log(
-      `[argus-slack-bot] OAuth installer at http://localhost:${SLACK_OAUTH_PORT}/slack/install`,
+      `[argus-slack-bot] OAuth installer at ${SLACK_SETTINGS.publicUrl || `http://localhost:${SLACK_SETTINGS.port}`}/slack/install`,
     );
     console.log(
       "[argus-slack-bot] (외부 도달 가능한 redirect URL 을 Slack 앱 설정에 등록해야 OAuth 가 동작)",
     );
   }
-  console.log(
-    "[argus-slack-bot] connected (Socket Mode). DM me 'help' 또는 채널에서 @argus 멘션.",
-  );
 
   // 4) Graceful shutdown
   const shutdown = async (sig: string) => {
@@ -849,10 +946,121 @@ async function main() {
     try {
       await mcpPool.closeAll();
     } catch {}
+    try {
+      oauthServer?.closeAllConnections();
+      oauthServer?.close();
+    } catch {}
+    try {
+      whatapLogin?.store.close();
+    } catch {}
     process.exit(0);
   };
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
+}
+
+// ── 와탭 로그인 모드 ─────────────────────────────────────────
+
+interface WhatapLoginRuntime {
+  settings: WhatapOAuthSettings;
+  store: WhatapLinkStore;
+  pending: PendingLogins;
+  manager: WhatapTokenManager;
+}
+
+/** 본인만 봐야 하는 답(로그인 링크, 연결 계정)을 보낼 곳. DM 이면 DM, 채널이면 ephemeral. */
+interface PrivateReplyContext {
+  teamId: string;
+  userId: string;
+  isDm: boolean;
+  channel: string;
+  threadTs?: string;
+  say: (args: { text: string; thread_ts?: string; blocks?: unknown[] }) => Promise<unknown>;
+  client: {
+    chat: {
+      postEphemeral: (args: {
+        channel: string;
+        user: string;
+        text: string;
+        thread_ts?: string;
+      }) => Promise<unknown>;
+    };
+  };
+}
+
+async function replyPrivately(ctx: PrivateReplyContext, text: string): Promise<void> {
+  if (ctx.isDm) {
+    await ctx.say({ text, thread_ts: ctx.threadTs });
+    return;
+  }
+  await ctx.client.chat.postEphemeral({
+    channel: ctx.channel,
+    user: ctx.userId,
+    text,
+    thread_ts: ctx.threadTs,
+  });
+}
+
+/** 로그인 링크는 그 Slack 사용자에게 묶여 있어 채널에 공개하면 다른 사람이 자기 와탭
+ *  계정을 그 사용자에게 연결할 수 있다. 그래서 항상 본인에게만 보낸다. */
+async function sendWhatapLoginLink(
+  rt: WhatapLoginRuntime,
+  ctx: PrivateReplyContext,
+): Promise<void> {
+  const url = loginStartUrl(
+    rt.settings.oauth.redirectUri,
+    rt.pending.create(ctx.teamId, ctx.userId),
+  );
+  await replyPrivately(
+    ctx,
+    [
+      ":key: 와탭 계정을 연결하면 내 권한으로 조회한 답을 받을 수 있어요.",
+      `<${url}|와탭 로그인 열기> 링크는 10분 동안 쓸 수 있고 나에게만 보여요.`,
+      ACCOUNT_SETUP_GUIDANCE,
+    ].join("\n"),
+  );
+}
+
+async function handleWhatapLoginCommand(
+  cmd: ParsedCommand,
+  rt: WhatapLoginRuntime,
+  ctx: PrivateReplyContext,
+): Promise<void> {
+  switch (cmd.kind) {
+    case "help":
+      await ctx.say({ text: WHATAP_LOGIN_HELP, thread_ts: ctx.threadTs });
+      return;
+    case "login":
+      await sendWhatapLoginLink(rt, ctx);
+      return;
+    case "whoami": {
+      const link = rt.store.get(ctx.teamId, ctx.userId);
+      await replyPrivately(
+        ctx,
+        link
+          ? `:bust_in_silhouette: 와탭 계정이 연결돼 있어요: ${link.email ?? link.subject}`
+          : "연결된 와탭 계정이 없어요. `login` 을 보내 연결하세요.",
+      );
+      return;
+    }
+    case "logout": {
+      const removed = await rt.manager.unlink(ctx.teamId, ctx.userId);
+      await replyPrivately(
+        ctx,
+        removed
+          ? ":wave: 와탭 계정 연결을 끊었어요. 다시 쓰려면 `login` 을 보내세요."
+          : "연결된 와탭 계정이 없어요.",
+      );
+      return;
+    }
+    case "register":
+    case "cookie":
+      await replyPrivately(
+        ctx,
+        ":warning: 이 봇은 와탭 로그인으로 연결해요. 토큰이나 cookie 는 보내지 말고 `login` 을 보내세요.",
+      );
+      return;
+  }
 }
 
 /** 사용자 creds 룩업 + default 폴백. 미등록 사용자에게도 운영자 default
