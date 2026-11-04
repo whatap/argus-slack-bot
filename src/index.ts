@@ -25,6 +25,7 @@ import { describeArgusSubTool, type ArgusDirectConfig } from "./argus-direct.js"
 import { runClaudeWithMcp, type ToolCallEntry } from "./claude-loop.js";
 import { ThreadHistory } from "./conversation.js";
 import { runDirectToArgus, type DirectRouteSnap } from "./direct-route.js";
+import { authorizationKind, createBotDmGuard, type ConversationsInfoClient } from "./dm-guard.js";
 import { humanizeError } from "./humanize.js";
 import { inferCurrentUrl } from "./screen-infer.js";
 import { SqliteInstallationStore } from "./installations.js";
@@ -38,6 +39,7 @@ import {
 } from "./oauth-http.js";
 import { splitForSlack, toSlackMrkdwn } from "./slack-format.js";
 import { createSlackApp, loadSlackSettings } from "./slack-app.js";
+import { createSlackFailureHandler } from "./slack-failure-log.js";
 import { createSlackLifecycleHandlers } from "./slack-lifecycle.js";
 import { ACCOUNT_SETUP_GUIDANCE, WHATAP_LOGIN_HELP } from "./onboarding.js";
 import { UserTokenStore, maskToken, type UserCreds } from "./user-tokens.js";
@@ -307,6 +309,9 @@ async function main() {
       },
     })),
   });
+  // 실패한 Slack 처리마다 시각·workspace·채널을 남긴다(본문·토큰 제외).
+  app.error(createSlackFailureHandler((...args) => console.error(...args)));
+  const isBotDm = createBotDmGuard();
 
   // 삭제 이벤트는 Bolt authorize 를 건너뛴다. 단일 workspace 의 신원은 미리 검증한다.
   if (!IS_MULTI_WORKSPACE) {
@@ -712,10 +717,31 @@ async function main() {
     // 봇 응답을 thread 댓글로만 보던 회귀.
     const replyThreadTs = m.thread_ts ? String(m.thread_ts) : undefined;
     const threadKey = `${channel}:${replyThreadTs ?? ts}`;
+    const teamId = (body as { team_id?: string }).team_id ?? "";
+    // 삭제 세대는 첫 await(봇 DM 확인) 전에 고정한다. 그 사이 삭제·재설치돼도 이 메시지는 버린다.
+    const history = /^T[A-Z0-9]+$/.test(teamId) ? threadHistory.forWorkspace(teamId) : undefined;
+    // 사용자 토큰 이벤트(user_events message.im)로 들어온, 봇이 없는 DM 은 처리하지 않는다.
+    const authorizations = (body as { authorizations?: unknown }).authorizations;
+    const verdict = await isBotDm({
+      teamId,
+      channel,
+      authorizations,
+      client: client as unknown as ConversationsInfoClient,
+    });
+    if (!verdict.ok) {
+      console.warn(
+        `[argus-slack-bot] ignored DM outside this bot's conversation at=${new Date().toISOString()} team=${teamId || "-"} channel=${channel || "-"} reason=${verdict.reason} auth=${authorizationKind(authorizations)}`,
+      );
+      return;
+    }
+    if (verdict.via === "membership") {
+      console.log(`[argus-slack-bot] verified bot DM via conversations.info team=${teamId} channel=${channel}`);
+    }
     await handle({
       text,
       userId: String(m.user ?? ""),
-      teamId: (body as { team_id?: string }).team_id ?? "",
+      teamId,
+      history,
       isDm: true,
       threadKey,
       threadTs: replyThreadTs,

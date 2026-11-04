@@ -131,6 +131,8 @@ export function slackAppOptions(
     clientOptions: deps.clientOptions,
     customRoutes: deps.customRoutes,
     logLevel: deps.logLevel ?? bolt.LogLevel.INFO,
+    // app.error 처리기가 실패한 이벤트의 body(채널·workspace)를 받게 한다.
+    extendedErrorHandler: true,
   };
 }
 

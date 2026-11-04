@@ -6,6 +6,7 @@ import { test } from "node:test";
 import bolt from "@slack/bolt";
 
 import { createSlackApp, loadSlackSettings, slackAppOptions } from "./slack-app.js";
+import { createSlackFailureHandler } from "./slack-failure-log.js";
 
 const SIGNING_SECRET = "test-signing-secret-not-a-real-credential";
 const HTTP_ENV = {
@@ -144,6 +145,46 @@ test("Socket remains the default, including existing local partial installer con
   assert.equal(options.socketMode, true);
   assert.equal(options.appToken, "test-app");
   assert.equal(options.token, "test-bot");
+});
+
+test("both transports pass the event body to the custom error handler", () => {
+  const socket = slackAppOptions(loadSlackSettings({ SLACK_APP_TOKEN: "test-app", SLACK_BOT_TOKEN: "test-bot" }));
+  const http = slackAppOptions(loadSlackSettings(HTTP_ENV));
+  assert.equal(socket.extendedErrorHandler, true);
+  assert.equal(http.extendedErrorHandler, true);
+});
+
+test("HTTP: a failed Slack reply reaches the error handler with its channel, not its text", { timeout: 5000 }, async (t) => {
+  const slack = http.createServer(async (req, res) => {
+    for await (const _chunk of req) { /* drain */ }
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify(req.url === "/auth.test"
+      ? { ok: true, team_id: "T1", bot_id: "B1", user_id: "UBOT" }
+      : { ok: false, error: "channel_not_found" }));
+  });
+  await new Promise<void>((resolve) => slack.listen(0, "127.0.0.1", resolve));
+  t.after(() => { slack.closeAllConnections(); slack.close(); });
+  const app = createSlackApp(loadSlackSettings(HTTP_ENV), {
+    clientOptions: { slackApiUrl: `http://127.0.0.1:${(slack.address() as AddressInfo).port}/` },
+    logLevel: bolt.LogLevel.ERROR,
+  });
+  const lines: string[] = [];
+  let logged!: () => void;
+  const done = new Promise<void>((resolve) => { logged = resolve; });
+  app.error(createSlackFailureHandler((...args) => { lines.push(args.map(String).join(" ")); logged(); }));
+  app.message(async ({ say }) => { await say("reply"); });
+  const server = await app.start({ port: 0, host: "127.0.0.1" });
+  t.after(() => app.stop());
+  const event = dmEvent();
+  event.event.text = "private-question-text";
+  const body = JSON.stringify(event);
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/slack/events`;
+  const response = await fetch(url, { method: "POST", headers: signedHeaders(body), body });
+  assert.equal(response.status, 200);
+  await done;
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /team=T1 channel=D1 channel_type=im thread=no kind=event:message code=slack_webapi_platform_error slack_error=channel_not_found/);
+  assert.doesNotMatch(lines[0], /private-question-text/);
 });
 
 test("HTTP signature guard rejects missing, forged, expired and changed bodies before dispatch", { timeout: 5000 }, async (t) => {
