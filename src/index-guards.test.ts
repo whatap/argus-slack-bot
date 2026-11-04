@@ -19,10 +19,16 @@ function gate<T = void>() {
 
 type Handler = (ctx: any) => Promise<void>;
 const tokens: TokenSet = { accessToken: "synthetic-access", refreshToken: "synthetic-refresh", expiresAt: Date.now() + 600_000 };
+// Slack reports one installation that can see the event. In the bot's own DM that is usually the bot.
+const BOT_AUTHORIZATION = [{ team_id: "T1", user_id: "UBOT", is_bot: true, is_enterprise_install: false }];
+const USER_AUTHORIZATION = [{ team_id: "T1", user_id: "U1", is_bot: false, is_enterprise_install: false }];
+const channelNotFound = () => Object.assign(new Error("An API error occurred: channel_not_found"), {
+  code: "slack_webapi_platform_error", data: { ok: false, error: "channel_not_found" },
+});
 
 // Execute the unchanged entrypoint and its actual bound listeners, replacing only
 // boot/transport boundaries. No dotenv, sockets, MCP children, or remote APIs.
-async function fixture(t: TestContext, oauth = true, multi = true) {
+async function fixture(t: TestContext, oauth = true, multi = true, opts: { captureErrors?: boolean } = {}) {
   const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
   const modules: Record<string, any> = {};
   for (const match of source.matchAll(/from\s+"(\.\/[^\"]+)"/g)) {
@@ -34,9 +40,13 @@ async function fixture(t: TestContext, oauth = true, multi = true) {
   const privatePosts: any[] = [];
   const publicPosts: any[] = [];
   const fetches: { url: string; init: RequestInit }[] = [];
+  const warnings: string[] = [];
+  const errors: string[] = [];
+  let errorHandler: Handler | undefined;
   let credsLookups = 0;
   let argusCalls = 0;
   let loginCreates = 0;
+  let infoCalls = 0;
   let pending!: PendingLogins;
   let links!: WhatapLinkStore;
   let installations!: SqliteInstallationStore;
@@ -52,12 +62,21 @@ async function fixture(t: TestContext, oauth = true, multi = true) {
       postMessage: async (args: any) => { publicPosts.push(args); return { ts: "1.1" }; },
       update: async (_args: any) => ({}),
     },
+    conversations: {
+      // The bot is in D1 (its DM with U1) and in no other DM.
+      info: async ({ channel }: { channel: string }): Promise<any> => {
+        infoCalls++;
+        if (channel === "D1") return { ok: true, channel: { id: "D1", is_im: true, user: "U1" } };
+        throw channelNotFound();
+      },
+    },
   };
   const app = {
     client,
     event: (name: string, handler: Handler) => { events.set(name, handler); },
     action: (pattern: RegExp, handler: Handler) => { actions.push({ pattern, handler }); },
     message: (handler: Handler) => { events.set("message", handler); },
+    error: (handler: Handler) => { errorHandler = handler; },
     start: async () => { ready.resolve(); },
   };
   modules["dotenv"] = { config: () => {} };
@@ -108,7 +127,15 @@ async function fixture(t: TestContext, oauth = true, multi = true) {
   const sandbox = {
     exports: {}, require: (id: string) => { assert.ok(id in modules, `unmocked import ${id}`); return modules[id]; },
     process: { env, on() {}, exit(code: number) { throw new Error(`unexpected startup exit ${code}`); } },
-    console: { log() {}, warn() {}, error(...args: any[]) { throw new Error(args.map(String).join(" ")); } },
+    console: {
+      log() {},
+      warn(...args: any[]) { warnings.push(args.map(String).join(" ")); },
+      error(...args: any[]) {
+        const line = args.map(String).join(" ");
+        if (!opts.captureErrors) throw new Error(line);
+        errors.push(line);
+      },
+    },
     fetch: async (url: string, init: RequestInit) => { fetches.push({ url, init }); return Response.json({ succeeded: [], failed: [] }); },
     URL, Date, setTimeout, clearTimeout,
   };
@@ -124,7 +151,11 @@ async function fixture(t: TestContext, oauth = true, multi = true) {
     return handler({ ack, client, body: { team: { id: team }, user: { id: "U1" }, channel: { id: "C1" }, message: { ts: "1.0" } }, action: { action_id: id, value: "내 프로젝트 보여줘" } });
   };
   const uninstall = (team = "T1", revoked = false) => events.get(revoked ? "tokens_revoked" : "app_uninstalled")!({ body: { team_id: team }, event: revoked ? { type: "tokens_revoked", tokens: { bot: ["UBOT"] } } : { type: "app_uninstalled" } });
-  const message = (text: string) => events.get("message")!({ body: { team_id: "T1" }, message: { channel_type: "im", channel: "D1", user: "U1", ts: "1.0", text }, say: client.chat.postMessage, client });
+  const message = (text: string, where: { channel?: string; authorizations?: unknown[] } = {}) => events.get("message")!({
+    body: { type: "event_callback", team_id: "T1", authorizations: where.authorizations ?? BOT_AUTHORIZATION },
+    message: { channel_type: "im", channel: where.channel ?? "D1", user: "U1", ts: "1.0", text },
+    say: client.chat.postMessage, client,
+  });
   const request = (url: string) => new Promise<{ status: number; headers: any; body: string }>((resolve) => {
     let status = 0; let headers: any;
     oauthHandler({ method: "GET", url } as http.IncomingMessage, { headersSent: false,
@@ -133,7 +164,8 @@ async function fixture(t: TestContext, oauth = true, multi = true) {
     } as unknown as http.ServerResponse);
   });
   return { action, message, uninstall, install, request, client, privatePosts, publicPosts, fetches, pending, links, history, installations, oauthClient,
-    counts: () => ({ credsLookups, argusCalls, loginCreates }) };
+    warnings, errors, errorHandler: () => errorHandler,
+    counts: () => ({ credsLookups, argusCalls, loginCreates, infoCalls }) };
 }
 
 for (const op of ["apply", "cancel"]) {
@@ -300,4 +332,74 @@ test("bound uninstall invalidates an exchanging callback even after reinstall", 
   release.resolve(tokens);
   assert.equal((await response).status, 400);
   assert.equal(f.links.get("T1", "U1"), null);
+});
+
+// A user-token event subscription (user_events message.im) delivers the linked user's DMs with
+// other people. Those must never become questions, even when the user has a linked account.
+test("a linked user's DM with someone else is ignored before any processing", { timeout: 5000 }, async (t) => {
+  const f = await fixture(t);
+  f.links.save({ ...tokens, teamId: "T1", slackUserId: "U1", subject: "linked" });
+  await f.message("private note to a colleague", { channel: "DOTHER", authorizations: USER_AUTHORIZATION });
+  assert.equal(f.counts().argusCalls, 0, "another conversation must not be forwarded to Argus");
+  assert.equal(f.counts().loginCreates, 0);
+  assert.equal(f.publicPosts.length + f.privatePosts.length, 0);
+  assert.equal((f.history as any).db.prepare("SELECT COUNT(*) AS n FROM thread_history").get().n, 0);
+  assert.equal(f.warnings.length, 1);
+  assert.match(f.warnings[0], /^\[argus-slack-bot\] ignored DM outside this bot's conversation at=\d{4}-\d{2}-\d{2}T/);
+  assert.match(f.warnings[0], / team=T1 channel=DOTHER reason=bot-not-in-conversation auth=user$/);
+  assert.doesNotMatch(f.warnings[0], /private note/);
+});
+
+test("an unlinked user's DM with someone else does not issue a login link", { timeout: 5000 }, async (t) => {
+  const f = await fixture(t);
+  await f.message("lunch?", { channel: "DOTHER", authorizations: USER_AUTHORIZATION });
+  assert.equal(f.counts().loginCreates, 0);
+  assert.equal(f.publicPosts.length + f.privatePosts.length, 0);
+});
+
+test("the bot's own DM is answered when Slack reports the user's authorization", { timeout: 5000 }, async (t) => {
+  const f = await fixture(t);
+  await f.message("내 프로젝트 보여줘", { authorizations: USER_AUTHORIZATION });
+  await f.message("내 프로젝트 보여줘", { authorizations: USER_AUTHORIZATION });
+  assert.equal(f.counts().infoCalls, 1, "membership is checked once per DM");
+  assert.equal(f.counts().loginCreates, 2, "both messages reach the normal login flow");
+  assert.equal(f.publicPosts.length, 2);
+  assert.equal(f.warnings.length, 0);
+});
+
+test("the bot's own DM reported with the bot authorization needs no membership check", { timeout: 5000 }, async (t) => {
+  const f = await fixture(t);
+  await f.message("내 프로젝트 보여줘");
+  assert.equal(f.counts().infoCalls, 0);
+  assert.equal(f.counts().loginCreates, 1);
+});
+
+test("a DM paused at the membership check cannot resume after uninstall and reinstall", { timeout: 5000 }, async (t) => {
+  const f = await fixture(t);
+  const entered = gate(); const release = gate();
+  f.client.conversations.info = async () => {
+    entered.resolve(); await release.promise;
+    return { ok: true, channel: { id: "D1", is_im: true, user: "U1" } };
+  };
+  const running = f.message("내 프로젝트 보여줘", { authorizations: USER_AUTHORIZATION });
+  await entered.promise;
+  await f.uninstall(); await f.install();
+  release.resolve(); await running;
+  assert.equal(f.counts().loginCreates, 0, "a DM received before uninstall must not issue a login after reinstall");
+  assert.equal(f.counts().argusCalls, 0);
+  assert.equal(f.publicPosts.length + f.privatePosts.length, 0);
+});
+
+test("the entrypoint logs Slack failures with time and channel, then rethrows", { timeout: 5000 }, async (t) => {
+  const f = await fixture(t, true, true, { captureErrors: true });
+  const handler = f.errorHandler();
+  assert.ok(handler, "entrypoint must register a Slack error handler");
+  const error = channelNotFound();
+  await assert.rejects(
+    handler({ error, body: { type: "event_callback", team_id: "T1", event: { type: "message", channel: "D9", channel_type: "im", text: "private question" } } }),
+    (thrown: unknown) => thrown === error,
+  );
+  assert.equal(f.errors.length, 1);
+  assert.match(f.errors[0], /slack handler failed at=\d{4}-\d{2}-\d{2}T\S+ team=T1 channel=D9 channel_type=im thread=no kind=event:message code=slack_webapi_platform_error slack_error=channel_not_found/);
+  assert.doesNotMatch(f.errors[0], /private question/);
 });
