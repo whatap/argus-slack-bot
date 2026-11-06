@@ -1,0 +1,74 @@
+name: CI
+
+# PR·main push 마다: 테스트·타입·빌드, 배포 스크립트 시험, 운영 묶음(linux arm64·x64) 빌드와 실행 확인.
+# 묶음 실행 확인은 ubuntu 22.04 컨테이너(arm64 는 QEMU)에서 묶음 안의 node 로 실제 진입점을 띄운다 (deploy/test/smoke.sh).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test · typecheck · build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run typecheck
+      - run: pnpm run test
+      - run: pnpm run build
+      - name: deploy script tests
+        run: pnpm run test:deploy
+
+  lint:
+    name: shellcheck · actionlint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - run: shellcheck deploy/*.sh deploy/test/*.sh
+      - run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color
+
+  bundle:
+    name: bundle (linux-${{ matrix.arch }})
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            platform: linux/arm64
+          - arch: x64
+            platform: linux/amd64
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build
+      - run: deploy/package.sh "${{ matrix.arch }}" out
+      - uses: docker/setup-qemu-action@v4
+        if: matrix.arch == 'arm64'
+      - name: smoke (${{ matrix.platform }}, ubuntu 22.04)
+        run: |
+          docker run --rm --platform "${{ matrix.platform }}" -v "$PWD:/w" -w /w ubuntu:22.04 \
+            bash deploy/test/smoke.sh out/*.tar.gz
