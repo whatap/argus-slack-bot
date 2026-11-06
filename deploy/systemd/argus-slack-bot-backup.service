@@ -1,0 +1,19 @@
+[Unit]
+Description=argus-slack-bot SQLite backup
+Documentation=https://github.com/whatap/argus-slack-bot/blob/main/docs/deploy-aws.md
+
+[Service]
+Type=oneshot
+User=whatap
+Group=whatap
+EnvironmentFile=/etc/argus-slack-bot/config.env
+Environment=HOME=/tmp
+ExecStart=/data/whatap/argus-slack-bot/current/deploy/backup.sh
+Nice=10
+IOSchedulingClass=idle
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/data/whatap/argus-slack-bot/data /data/whatap/argus-slack-bot/backups

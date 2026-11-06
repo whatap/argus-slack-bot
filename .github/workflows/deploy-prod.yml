@@ -1,0 +1,190 @@
+name: Deploy argus-slack-bot (Prod)
+
+# 수동 실행만 한다. 서버·IAM·변수가 준비되기 전에는 아무 것도 바꾸지 않는다.
+#   action=status    인스턴스 상태만 읽는다
+#   action=deploy    실행한 ref(main) 의 커밋을 묶음으로 만들어 S3 → SSM 으로 설치한다.
+#                    헬스체크를 못 넘으면 서버가 직전 판으로 되돌린다 (deploy/remote-install.sh)
+#   action=rollback  지금 판 직전에 돌던 판으로 바꾼다
+# 실행: gh workflow run deploy-prod.yml --ref main -f action=deploy
+#
+# GitHub environment `production` 의 variables (DevOps 가 준 값):
+#   AWS_REGION, AWS_ROLE_ARN, S3_BUCKET, S3_PREFIX, INSTANCE_ID
+# IAM 역할 trust 는 repo:whatap/argus-slack-bot:environment:production 로 묶는다.
+# environment production 의 deployment branch 는 main 만 허용해야 한다 (다른 ref 로 돌리면 그 ref 의 스크립트가 운영 서버에서 root 로 돈다).
+# 서버 준비·권한 목록·확인 절차: docs/deploy-aws.md
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: status | deploy | rollback
+        type: choice
+        options: [status, deploy, rollback]
+        default: status
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  bundle:
+    name: bundle (linux-${{ matrix.arch }})
+    if: inputs.action == 'deploy'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            platform: linux/arm64
+          - arch: x64
+            platform: linux/amd64
+    steps:
+      - name: Deploy 는 main 에서만
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::deploy 는 main 에서만 실행해요 (지금 ${GITHUB_REF})"
+          exit 1
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run typecheck
+      - run: pnpm run test
+      - run: pnpm run build
+      - run: deploy/package.sh "${{ matrix.arch }}" out
+      - uses: docker/setup-qemu-action@v4
+        if: matrix.arch == 'arm64'
+      - name: smoke (${{ matrix.platform }}, ubuntu 22.04)
+        run: |
+          docker run --rm --platform "${{ matrix.platform }}" -v "$PWD:/w" -w /w ubuntu:22.04 \
+            bash deploy/test/smoke.sh out/*.tar.gz
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bundle-${{ matrix.arch }}
+          path: out/
+          retention-days: 14
+          if-no-files-found: error
+
+  deploy:
+    name: ${{ inputs.action }} (production)
+    needs: bundle
+    # always() 는 취소된 실행에서도 돈다. 취소되지 않았고 묶음이 성공(deploy)했거나 건너뛰었을(status·rollback) 때만 돈다.
+    # YAML 값은 ! 로 시작할 수 없어 ${{ }} 로 감싼다.
+    if: ${{ !cancelled() && (needs.bundle.result == 'success' || needs.bundle.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 30
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      ACTION: ${{ inputs.action }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      S3_BUCKET: ${{ vars.S3_BUCKET }}
+      S3_PREFIX: ${{ vars.S3_PREFIX }}
+      INSTANCE_ID: ${{ vars.INSTANCE_ID }}
+    steps:
+      # 실수 방지용이다. 실제 방어는 environment production 의 deployment branch 규칙(main 만)이다.
+      - name: production 작업은 main 에서만
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::production 작업(${ACTION})은 main 에서만 실행해요 (지금 ${GITHUB_REF})"
+          exit 1
+
+      - uses: actions/checkout@v5
+
+      - name: Check production variables
+        run: |
+          missing=""
+          for v in AWS_REGION AWS_ROLE_ARN S3_BUCKET S3_PREFIX INSTANCE_ID; do
+            [ -n "${!v:-}" ] || missing="$missing $v"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::production environment variables 가 없어요:$missing (docs/deploy-aws.md)"
+            exit 1
+          fi
+          echo "$INSTANCE_ID" | grep -Eq '^i-[0-9a-f]{8,17}$' || { echo "::error::INSTANCE_ID 형식"; exit 1; }
+          echo "$S3_BUCKET" | grep -Eq '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$' || { echo "::error::S3_BUCKET 형식"; exit 1; }
+          echo "$S3_PREFIX" | grep -Eq '^[A-Za-z0-9._/-]+$' || { echo "::error::S3_PREFIX 형식"; exit 1; }
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: argus-slack-bot-${{ github.run_id }}
+
+      - name: Caller identity
+        run: aws sts get-caller-identity --query Arn --output text
+
+      - name: Preflight (status)
+        id: pre
+        run: |
+          set -o pipefail
+          deploy/ssm-run.sh status | tee status.log
+          arch=$(sed -n 's/^ARCH=//p' status.log)
+          case "$arch" in arm64|x64) ;; *) echo "::error::인스턴스 아키텍처를 알 수 없어요: $arch"; exit 1 ;; esac
+          echo "arch=$arch" >> "$GITHUB_OUTPUT"
+
+      - name: Rollback
+        if: inputs.action == 'rollback'
+        run: |
+          set -o pipefail
+          deploy/ssm-run.sh rollback | tee rollback.log
+          grep -q '^ROLLBACK-OK' rollback.log
+
+      - uses: actions/download-artifact@v8
+        if: inputs.action == 'deploy'
+        with:
+          name: bundle-${{ steps.pre.outputs.arch }}
+          path: out
+
+      - name: Upload bundle to S3
+        id: upload
+        if: inputs.action == 'deploy'
+        run: |
+          set -euo pipefail
+          cd out
+          files=(*.tar.gz)
+          f=${files[0]}
+          sha256sum -c "$f.sha256"
+          sha=$(cut -d' ' -f1 "$f.sha256")
+          release="$(date -u +%Y%m%d%H%M%S)-${GITHUB_SHA::12}"
+          key="${S3_PREFIX%/}/$release/$f"
+          aws s3 cp "$f" "s3://$S3_BUCKET/$key" --only-show-errors \
+            --metadata "sha256=$sha,commit=$GITHUB_SHA,run=$GITHUB_RUN_ID"
+          {
+            echo "release=$release"
+            echo "key=$key"
+            echo "sha=$sha"
+          } >> "$GITHUB_OUTPUT"
+          echo "uploaded s3://$S3_BUCKET/$key"
+
+      - name: Install on instance (SSM)
+        if: inputs.action == 'deploy'
+        env:
+          RELEASE: ${{ steps.upload.outputs.release }}
+          KEY: ${{ steps.upload.outputs.key }}
+          SHA: ${{ steps.upload.outputs.sha }}
+        run: |
+          set -o pipefail
+          deploy/ssm-run.sh deploy --bucket "$S3_BUCKET" --key "$KEY" --sha256 "$SHA" \
+            --release "$RELEASE" --region "$AWS_REGION" | tee deploy.log
+          grep -q '^DEPLOY-OK' deploy.log
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### argus-slack-bot ${ACTION}"
+            echo '```'
+            cat status.log rollback.log deploy.log 2>/dev/null | grep -E '^(CURRENT|ARCH|SERVICE|HEALTH|HISTORY|DEPLOY-|FIRST-DEPLOY-|ROLLBACK-|STATUS-)' || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,42 @@
+[Unit]
+Description=argus-slack-bot (WhaTap Argus Slack bot)
+Documentation=https://github.com/whatap/argus-slack-bot/blob/main/docs/deploy-aws.md
+After=network-online.target
+Wants=network-online.target
+# 시작 횟수 제한을 두지 않는다. 배포 헬스 대기 중에 죽기를 반복해도 되돌린 판의 restart 가 거부되지 않고,
+# 부팅 때 Secrets Manager·IMDS 가 잠시 실패해도 계속 다시 시도한다.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=whatap
+Group=whatap
+WorkingDirectory=/data/whatap/argus-slack-bot/current
+# 비밀이 아닌 운영 설정 (deploy/config.env.example)
+EnvironmentFile=/etc/argus-slack-bot/config.env
+# 비밀값 5개 — ExecStartPre 가 Secrets Manager 에서 읽어 만든다. 서비스가 멈추면 RuntimeDirectory 와 함께 지워진다.
+EnvironmentFile=-/run/argus-slack-bot/secrets.env
+Environment=NODE_ENV=production
+RuntimeDirectory=argus-slack-bot
+RuntimeDirectoryMode=0750
+# ExecStartPre 도 서비스 계정으로 아래 샌드박스 안에서 돈다 (묶음의 코드는 root 로 돌리지 않는다).
+# 쓰는 곳은 RuntimeDirectory 뿐이고, aws 는 IMDS 로 인스턴스 역할을 쓴다.
+ExecStartPre=/data/whatap/argus-slack-bot/current/deploy/load-secrets.sh
+ExecStart=/data/whatap/argus-slack-bot/current/node/bin/node dist/index.js
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/data/whatap/argus-slack-bot/data
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
