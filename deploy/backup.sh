@@ -5,9 +5,9 @@
 # 사본은 토큰이 암호화된 그대로다. 복구에는 같은 SLACK_TOKENS_ENCRYPTION_KEY 가 필요하다.
 set -euo pipefail
 
-: "${SLACK_INSTALLATIONS_DB:?SLACK_INSTALLATIONS_DB 가 /etc/argus-slack-bot/config.env 에 필요해요}"
-: "${SLACK_USER_TOKENS_DB:?SLACK_USER_TOKENS_DB 가 /etc/argus-slack-bot/config.env 에 필요해요}"
-: "${SLACK_THREAD_HISTORY_DB:?SLACK_THREAD_HISTORY_DB 가 /etc/argus-slack-bot/config.env 에 필요해요}"
+: "${SLACK_INSTALLATIONS_DB:?SLACK_INSTALLATIONS_DB 가 /data/whatap/argus-slack-bot/conf/config.env 에 필요해요}"
+: "${SLACK_USER_TOKENS_DB:?SLACK_USER_TOKENS_DB 가 /data/whatap/argus-slack-bot/conf/config.env 에 필요해요}"
+: "${SLACK_THREAD_HISTORY_DB:?SLACK_THREAD_HISTORY_DB 가 /data/whatap/argus-slack-bot/conf/config.env 에 필요해요}"
 APP_ROOT=${APP_ROOT:-/data/whatap/argus-slack-bot}
 KEEP_LOCAL=${KEEP_LOCAL_BACKUPS:-7}
 REL="$APP_ROOT/current"

@@ -65,16 +65,16 @@ CI(`ci.yml`)는 PR 마다 두 아키텍처 묶음을 만들어 ubuntu 22.04 컨�
 
 ## 서버 최초 준비 (1회)
 
-`deploy/config.env.example` 을 채워 `/etc/argus-slack-bot/config.env` 로 둔다. 비밀값은 넣지 않는다.
+`deploy/config.env.example` 을 채워 `/data/whatap/argus-slack-bot/conf/config.env` 로 둔다. 비밀값은 넣지 않는다.
 
 ```sh
 id whatap || sudo useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin whatap
-sudo install -d -m 0750 -o root -g whatap /etc/argus-slack-bot
-sudo install -m 0640 -o root -g whatap config.env /etc/argus-slack-bot/config.env
 sudo install -d -m 0755 -o root -g root /data/whatap /data/whatap/argus-slack-bot
+sudo install -d -m 0750 -o root -g whatap /data/whatap/argus-slack-bot/conf
+sudo install -m 0640 -o root -g whatap config.env /data/whatap/argus-slack-bot/conf/config.env
 ```
 
-`/data/whatap` 과 `/data/whatap/argus-slack-bot` 은 root 소유이고 group·other 쓰기 권한이 없어야 한다. root 로 도는 배포 스크립트가 그 아래에 묶음을 풀고 unit 이 그 아래 파일을 실행하므로, 아니면 배포·되돌리기가 `UNSAFE-DIR` 로 멈춘다 (`releases/` 도 같다).
+`/data/whatap`, `/data/whatap/argus-slack-bot`, `conf/` 는 root 소유이고 group·other 쓰기 권한이 없어야 한다 (`config.env` 도 같다). root 로 도는 배포 스크립트가 그 아래에 묶음을 풀고 unit 이 그 아래 파일을 실행·읽으므로, 아니면 배포·되돌리기가 `UNSAFE-DIR`(`config.env` 는 `UNSAFE-CONFIG`)로 멈춘다 (`releases/` 도 같다). `conf/` 는 배포마다 바뀌는 `releases/` 나 서비스 계정이 쓰는 `data/` 와 따로 두고, 배포는 건드리지 않는다.
 
 첫 배포가 `releases/`, `data/`, `backups/` 를 만들고 systemd unit 3개(`argus-slack-bot.service`, `argus-slack-bot-backup.service`·`.timer`)를 설치·활성화한다. 이후 배포는 묶음의 unit 이 바뀌었을 때만 교체한다.
 
@@ -103,10 +103,10 @@ rollback 은 `history` 기준으로 지금 판 직전에 돌던 판으로 바꾼
 서버 경로:
 
 ```
-/etc/argus-slack-bot/config.env          비밀이 아닌 설정 (root:whatap 0640)
-/run/argus-slack-bot/secrets.env         시작할 때 서비스 계정이 Secrets Manager 에서 만든다 (whatap 0600). 서비스가 멈추면 지워진다
+/run/argus-slack-bot/secrets.env         시작할 때 서비스 계정이 Secrets Manager 에서 만든다 (whatap 0600). 메모리(tmpfs)라 디스크·스냅샷에 남지 않고, 서비스가 멈추면 지워진다
 /data/whatap/                            root 소유, group·other 쓰기 금지
 /data/whatap/argus-slack-bot/            root 소유, group·other 쓰기 금지
+  conf/config.env                        비밀이 아닌 설정 (conf/ root:whatap 0750, 파일 root:whatap 0640). 배포가 바꾸지 않는다
   releases/<UTC시각>-<커밋>/              root 소유, 읽기 전용
   current -> releases/...
   data/                                  SQLite (whatap 0700)

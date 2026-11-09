@@ -61,13 +61,14 @@ secret_json() {  # [뺄 키] — 시험용 가짜 값
   echo "$out}"
 }
 
-run() {  # <비밀 JSON> [aws 실패면 1] → 출력 $T/out.log, 종료 코드 $RC
+run() {  # <비밀 JSON> [aws 실패면 1] [뺄 환경변수] → 출력 $T/out.log, 종료 코드 $RC
   rm -rf "$T/run"
   : > "$T/mktemp.log"
   set +e
   (
     export PATH="$T/bin:$PATH" ASB_T="$T" ASB_FAKE_SECRET="$1" ASB_FAKE_AWS_FAIL="${2:-0}" \
       ASB_SECRETS_ID=asb-test-secret AWS_REGION=ap-northeast-2 ASB_RUNTIME_DIR="$T/run"
+    [ -z "${3:-}" ] || unset "$3"
     "$T/app/current/deploy/load-secrets.sh"
   ) > "$T/out.log" 2>&1
   RC=$?
@@ -104,6 +105,10 @@ run "$(secret_json)"
 check "변환 결과가 비면 → 실패" '[ "$RC" -ne 0 ]'
 check "변환 결과가 비면 → secrets.env 없음" '[ ! -e "$T/run/secrets.env" ]'
 check "변환 결과가 비면 → 임시 파일 남기지 않음" 'tmp_cleaned'
+
+# 설정이 빠지면 넣을 파일 위치를 알려 준다
+run "$(secret_json)" 0 ASB_SECRETS_ID
+check "ASB_SECRETS_ID 가 없으면 → 실패, conf/config.env 에 넣으라고 알림" '[ "$RC" -ne 0 ] && grep -qF "ASB_SECRETS_ID 가 /data/whatap/argus-slack-bot/conf/config.env 에 필요해요" "$T/out.log"'
 
 echo "# pass=$PASSES fail=$FAILS"
 [ "$FAILS" -eq 0 ]

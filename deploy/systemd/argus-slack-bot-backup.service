@@ -6,7 +6,7 @@ Documentation=https://github.com/whatap/argus-slack-bot/blob/main/docs/deploy-aw
 Type=oneshot
 User=whatap
 Group=whatap
-EnvironmentFile=/etc/argus-slack-bot/config.env
+EnvironmentFile=/data/whatap/argus-slack-bot/conf/config.env
 Environment=HOME=/tmp
 ExecStart=/data/whatap/argus-slack-bot/current/deploy/backup.sh
 Nice=10
