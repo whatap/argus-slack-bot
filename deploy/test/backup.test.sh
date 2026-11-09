@@ -91,7 +91,7 @@ check "DB 하나가 없으면 → 오래된 백업을 지우지 않음" 'old_unt
 check "DB 하나가 없으면 → S3 로 올리지 않음" '! grep -q "^aws s3 cp" "$T/calls.log"'
 
 run -u SLACK_USER_TOKENS_DB
-check "DB 변수가 없으면 → 실패" '[ "$RC" -ne 0 ] && grep -q "SLACK_USER_TOKENS_DB" "$T/out.log"'
+check "DB 변수가 없으면 → 실패, conf/config.env 에 넣으라고 알림" '[ "$RC" -ne 0 ] && grep -qF "SLACK_USER_TOKENS_DB 가 /data/whatap/argus-slack-bot/conf/config.env 에 필요해요" "$T/out.log"'
 check "DB 변수가 없으면 → 오래된 백업을 지우지 않음" 'old_untouched'
 
 run BACKUP_S3_URI=s3://asb-test-bucket/backups/

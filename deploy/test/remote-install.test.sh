@@ -49,7 +49,7 @@ host_arch() {
 }
 
 setup_shims() {
-  mkdir -p "$T/bin" "$T/s3" "$T/state" "$T/etc" "$T/units"
+  mkdir -p "$T/bin" "$T/s3" "$T/state" "$T/units"
   : > "$T/calls.log"
 
   cat > "$T/bin/aws" <<'EOF'
@@ -157,11 +157,12 @@ EOF
   tar -czf "$T/s3/$name.tar.gz" -C "$b" .
 }
 
-run() {  # remote-install.sh 인자… → 출력 $T/out.log, 종료 코드 $RC
+run() {  # remote-install.sh 인자… → 출력 $T/out.log, 종료 코드 $RC. CFG 로 CONFIG_FILE 을 바꾸고, NOCFG=1 이면 넘기지 않는다(기본 위치)
   set +e
   (
-    export PATH="$T/bin:$PATH" ASB_T="$T" APP_ROOT="${ROOT:-$T/app}" CONFIG_FILE="$T/etc/config.env" \
+    export PATH="$T/bin:$PATH" ASB_T="$T" APP_ROOT="${ROOT:-$T/app}" CONFIG_FILE="${CFG:-$T/app/conf/config.env}" \
       UNIT_DIR="$T/units" HEALTH_TRIES=2 HEALTH_INTERVAL=0 KEEP_RELEASES="${KEEP:-5}" TRUSTED_OWNER_UID="$REAL_UID"
+    [ -z "${NOCFG:-}" ] || unset CONFIG_FILE
     bash "$SCRIPT" "$@"
   ) > "$T/out.log" 2>&1
   RC=$?
@@ -179,12 +180,19 @@ current() { basename "$(readlink "$T/app/current" 2>/dev/null || echo none)"; }
 [ -f "$SCRIPT" ] || { echo "FAIL - $SCRIPT 없음"; exit 1; }
 setup_shims
 
-# 설정 파일이 없으면 S3 를 부르기 전에 멈춘다
+# 설정 파일이 없으면 S3 를 부르기 전에 멈춘다. 기본 위치는 APP_ROOT/conf/config.env
 make_bundle r00
+NOCFG=1
 deploy r00
-check "config.env 없음 → 실패" '[ "$RC" -ne 0 ] && grep -q "CONFIG-MISSING" "$T/out.log"'
+NOCFG=""
+check "config.env 없음 → 실패, 기본 위치 APP_ROOT/conf/config.env 를 알림" '[ "$RC" -ne 0 ] && grep -qF "CONFIG-MISSING $T/app/conf/config.env " "$T/out.log"'
 check "config.env 없음 → S3 다운로드 안 함" '! grep -q "aws s3 cp" "$T/calls.log"'
-printf 'SLACK_HTTP_PORT=3000\nWHATAP_OAUTH_PORT=3901\n' > "$T/etc/config.env"
+mkdir -p "$T/app/conf"
+printf 'SLACK_HTTP_PORT=3000\nWHATAP_OAUTH_PORT=3901\n' > "$T/app/conf/config.env"
+# 문서대로 conf/ 0750, config.env 0640 (부른 쪽 umask 와 상관없이)
+chmod 755 "$T/app"
+chmod 750 "$T/app/conf"
+chmod 640 "$T/app/conf/config.env"
 
 # 첫 배포가 헬스체크에 실패하면 되돌릴 곳이 없다
 touch "$T/state/bad-r00"
@@ -202,6 +210,7 @@ check "unit 3개 설치" '[ -f "$T/units/argus-slack-bot.service" ] && [ -f "$T/
 U="$T/units/argus-slack-bot.service"
 check "서비스 unit: 시작 횟수 제한 없이 5초마다 재시작" 'grep -qx "StartLimitIntervalSec=0" "$U" && ! grep -q "^StartLimitBurst=" "$U" && grep -qx "RestartSec=5" "$U"'
 check "서비스 unit: ExecStartPre 도 서비스 계정으로 (+ 없음)" 'grep -qx "ExecStartPre=/data/whatap/argus-slack-bot/current/deploy/load-secrets.sh" "$U" && ! grep -q "^ExecStartPre=[-@:!+]*+" "$U"'
+check "서비스·백업 unit 의 설정 파일 = /data/whatap/argus-slack-bot/conf/config.env" 'grep -qx "EnvironmentFile=/data/whatap/argus-slack-bot/conf/config.env" "$U" && grep -qx "EnvironmentFile=/data/whatap/argus-slack-bot/conf/config.env" "$T/units/argus-slack-bot-backup.service"'
 check "백업 timer 켬" 'grep -q "systemctl enable --now argus-slack-bot-backup.timer" "$T/calls.log"'
 check "data·backups 디렉터리" '[ -d "$T/app/data" ] && [ -d "$T/app/backups" ]'
 
@@ -299,6 +308,41 @@ deploy r21
 chmod g-w "$T/app"
 check "group 쓰기 가능한 APP_ROOT → UNSAFE-DIR, S3 다운로드 안 함" '[ "$RC" -ne 0 ] && grep -qF "DEPLOY-FAILED UNSAFE-DIR $T/app (" "$T/out.log" && ! grep -q "aws s3 cp" "$T/calls.log"'
 check "UNSAFE-DIR → current 그대로" '[ "$(current)" = r14 ] && [ ! -e "$T/app/releases/r21" ]'
+
+# 설정 디렉터리(conf/)와 config.env 도 다른 계정이 바꿀 수 없어야 한다 (S3 를 부르기 전에 멈춘다)
+make_bundle r23
+chmod g+w "$T/app/conf"
+: > "$T/calls.log"
+deploy r23
+chmod g-w "$T/app/conf"
+check "group 쓰기 가능한 conf/ → UNSAFE-DIR, S3 다운로드 안 함" '[ "$RC" -ne 0 ] && grep -qF "DEPLOY-FAILED UNSAFE-DIR $T/app/conf (" "$T/out.log" && ! grep -q "aws s3 cp" "$T/calls.log"'
+chmod g+w "$T/app/conf/config.env"
+: > "$T/calls.log"
+deploy r23
+chmod g-w "$T/app/conf/config.env"
+check "group 쓰기 가능한 config.env → UNSAFE-CONFIG, S3 다운로드 안 함" '[ "$RC" -ne 0 ] && grep -qF "DEPLOY-FAILED UNSAFE-CONFIG $T/app/conf/config.env (" "$T/out.log" && ! grep -q "aws s3 cp" "$T/calls.log"'
+chmod g+w "$T/app/conf/config.env"
+run rollback
+chmod g-w "$T/app/conf/config.env"
+check "group 쓰기 가능한 config.env → rollback 도 UNSAFE-CONFIG" '[ "$RC" -ne 0 ] && grep -qF "ROLLBACK-FAILED UNSAFE-CONFIG $T/app/conf/config.env (" "$T/out.log"'
+check "conf/·config.env 거부 → current 그대로" '[ "$(current)" = r14 ] && [ ! -e "$T/app/releases/r23" ]'
+
+# 설정 경로가 심볼릭 링크면 가리키는 곳의 소유자를 본다. 시스템 파일(root 소유)을 다른 계정 소유로 쓰므로
+# root 가 아닌 사용자로 돌 때만 한다 (CI 와 개발 PC). 링크만 지우고 가리키는 파일은 건드리지 않는다.
+if [ "$REAL_UID" != 0 ]; then
+  mv "$T/app/conf/config.env" "$T/app/conf/config.env.real"
+  ln -s /etc/hosts "$T/app/conf/config.env"
+  run rollback
+  rm "$T/app/conf/config.env"
+  mv "$T/app/conf/config.env.real" "$T/app/conf/config.env"
+  check "config.env 가 다른 계정 소유 파일로 가는 링크 → UNSAFE-CONFIG" '[ "$RC" -ne 0 ] && grep -qF "ROLLBACK-FAILED UNSAFE-CONFIG $T/app/conf/config.env (0 " "$T/out.log" && [ "$(current)" = r14 ]'
+  ln -s /etc "$T/app/etc-link"
+  CFG="$T/app/etc-link/hosts"
+  run rollback
+  CFG=""
+  rm "$T/app/etc-link"
+  check "설정 디렉터리가 다른 계정 소유 디렉터리로 가는 링크 → UNSAFE-DIR" '[ "$RC" -ne 0 ] && grep -qF "ROLLBACK-FAILED UNSAFE-DIR $T/app/etc-link (0 " "$T/out.log" && [ "$(current)" = r14 ]'
+fi
 
 # APP_ROOT 의 상위가 다른 디스크로 가는 심볼릭 링크여도 된다: 링크 자체가 아니라 가리키는 디렉터리를 검사한다.
 # 리눅스 심볼릭 링크는 늘 777 이라 macOS 에서도 같게 umask 000 으로 만든다.

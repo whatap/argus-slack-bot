@@ -12,8 +12,8 @@ Type=simple
 User=whatap
 Group=whatap
 WorkingDirectory=/data/whatap/argus-slack-bot/current
-# 비밀이 아닌 운영 설정 (deploy/config.env.example)
-EnvironmentFile=/etc/argus-slack-bot/config.env
+# 비밀이 아닌 운영 설정 (deploy/config.env.example). root 소유 conf/ 에 두고 배포는 바꾸지 않는다.
+EnvironmentFile=/data/whatap/argus-slack-bot/conf/config.env
 # 비밀값 5개 — ExecStartPre 가 Secrets Manager 에서 읽어 만든다. 서비스가 멈추면 RuntimeDirectory 와 함께 지워진다.
 EnvironmentFile=-/run/argus-slack-bot/secrets.env
 Environment=NODE_ENV=production

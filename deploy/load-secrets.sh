@@ -6,8 +6,8 @@
 # config.env 에서: ASB_SECRETS_ID(비밀 이름 또는 ARN), AWS_REGION
 set -euo pipefail
 
-: "${ASB_SECRETS_ID:?ASB_SECRETS_ID 가 /etc/argus-slack-bot/config.env 에 필요해요}"
-: "${AWS_REGION:?AWS_REGION 이 /etc/argus-slack-bot/config.env 에 필요해요}"
+: "${ASB_SECRETS_ID:?ASB_SECRETS_ID 가 /data/whatap/argus-slack-bot/conf/config.env 에 필요해요}"
+: "${AWS_REGION:?AWS_REGION 이 /data/whatap/argus-slack-bot/conf/config.env 에 필요해요}"
 OUT_DIR=${ASB_RUNTIME_DIR:-/run/argus-slack-bot}
 APP_DIR=$(cd "$(dirname "$0")/.." && pwd)
 
