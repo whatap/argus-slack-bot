@@ -24,8 +24,7 @@ if [ -z "${ASB_INSTALL_SCRIPT:-}" ]; then
   exit "$rc"
 fi
 SCRIPT=$ASB_INSTALL_SCRIPT
-# id shim 은 uid 0 을 돌려주므로 디렉터리 소유자 검사(TRUSTED_OWNER_UID)에 쓸 실제 uid 를 shim 보다 먼저 읽어 둔다
-REAL_UID=$(id -u)
+REPO=$(cd "$HERE/../.." && pwd)
 T=$(mktemp -d "${TMPDIR:-/tmp}/asb-install.XXXXXX")
 trap 'rm -rf "$T"' EXIT
 PASSES=0
@@ -43,6 +42,8 @@ check() {  # <이름> <조건식>
 sha() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
 }
+
+owner_uid() { stat -c %u "$1" 2>/dev/null || stat -f %u "$1"; }
 
 host_arch() {
   case "$(uname -m)" in aarch64|arm64) echo arm64 ;; x86_64|amd64) echo x64 ;; *) uname -m ;; esac
@@ -82,6 +83,8 @@ case "$1" in
     touch "$s/active" ;;
   stop) rm -f "$s/active" ;;
   reset-failed) rm -f "$s/limit-hit" ;;
+  # 서버에 unit 이 설치돼 있는지 (no-unit 표시가 있으면 없는 것)
+  cat) if [ -f "$s/no-unit" ]; then echo "No files found for ${2:-}." >&2; exit 1; fi ;;
 esac
 exit 0
 EOF
@@ -157,12 +160,13 @@ EOF
   tar -czf "$T/s3/$name.tar.gz" -C "$b" .
 }
 
-run() {  # remote-install.sh 인자… → 출력 $T/out.log, 종료 코드 $RC. CFG 로 CONFIG_FILE 을 바꾸고, NOCFG=1 이면 넘기지 않는다(기본 위치)
+run() {  # remote-install.sh 인자… → 출력 $T/out.log, 종료 코드 $RC. CFG 로 CONFIG_FILE 을 바꾸고, NOCFG=1 이면 넘기지 않는다(기본 위치). NOROOT=1 이면 APP_ROOT 도 기본값
   set +e
   (
     export PATH="$T/bin:$PATH" ASB_T="$T" APP_ROOT="${ROOT:-$T/app}" CONFIG_FILE="${CFG:-$T/app/conf/config.env}" \
-      UNIT_DIR="$T/units" HEALTH_TRIES=2 HEALTH_INTERVAL=0 KEEP_RELEASES="${KEEP:-5}" TRUSTED_OWNER_UID="$REAL_UID"
+      UNIT_DIR="$T/units" HEALTH_TRIES=2 HEALTH_INTERVAL=0 KEEP_RELEASES="${KEEP:-5}"
     [ -z "${NOCFG:-}" ] || unset CONFIG_FILE
+    [ -z "${NOROOT:-}" ] || unset APP_ROOT
     bash "$SCRIPT" "$@"
   ) > "$T/out.log" 2>&1
   RC=$?
@@ -187,6 +191,13 @@ deploy r00
 NOCFG=""
 check "config.env 없음 → 실패, 기본 위치 APP_ROOT/conf/config.env 를 알림" '[ "$RC" -ne 0 ] && grep -qF "CONFIG-MISSING $T/app/conf/config.env " "$T/out.log"'
 check "config.env 없음 → S3 다운로드 안 함" '! grep -q "aws s3 cp" "$T/calls.log"'
+# 서버 규칙(DEVOPS-6837): 앱은 /data/whatap/plugin 아래에 둔다
+NOROOT=1
+NOCFG=1
+deploy r00
+NOROOT=""
+NOCFG=""
+check "APP_ROOT 기본값 = /data/whatap/plugin/argus-slack-bot" '[ "$RC" -ne 0 ] && grep -qF "CONFIG-MISSING /data/whatap/plugin/argus-slack-bot/conf/config.env " "$T/out.log"'
 mkdir -p "$T/app/conf"
 printf 'SLACK_HTTP_PORT=3000\nWHATAP_OAUTH_PORT=3901\n' > "$T/app/conf/config.env"
 # 문서대로 conf/ 0750, config.env 0640 (부른 쪽 umask 와 상관없이)
@@ -206,19 +217,22 @@ make_bundle r01
 deploy r01
 check "배포 성공 표식" '[ "$RC" -eq 0 ] && grep -q "^DEPLOY-OK release=r01" "$T/out.log"'
 check "current → r01" '[ "$(current)" = r01 ]'
-check "unit 3개 설치" '[ -f "$T/units/argus-slack-bot.service" ] && [ -f "$T/units/argus-slack-bot-backup.service" ] && [ -f "$T/units/argus-slack-bot-backup.timer" ]'
-U="$T/units/argus-slack-bot.service"
-check "서비스 unit: 시작 횟수 제한 없이 5초마다 재시작" 'grep -qx "StartLimitIntervalSec=0" "$U" && ! grep -q "^StartLimitBurst=" "$U" && grep -qx "RestartSec=5" "$U"'
-check "서비스 unit: ExecStartPre 도 서비스 계정으로 (+ 없음)" 'grep -qx "ExecStartPre=/data/whatap/argus-slack-bot/current/deploy/load-secrets.sh" "$U" && ! grep -q "^ExecStartPre=[-@:!+]*+" "$U"'
-check "서비스·백업 unit 의 설정 파일 = /data/whatap/argus-slack-bot/conf/config.env" 'grep -qx "EnvironmentFile=/data/whatap/argus-slack-bot/conf/config.env" "$U" && grep -qx "EnvironmentFile=/data/whatap/argus-slack-bot/conf/config.env" "$T/units/argus-slack-bot-backup.service"'
-check "백업 timer 켬" 'grep -q "systemctl enable --now argus-slack-bot-backup.timer" "$T/calls.log"'
+# 서버 디렉터리·설정은 whatap 소유가 규칙이다 (시험에서는 이 시험을 돌리는 계정 소유)
+check "APP_ROOT·conf/·config.env 가 root 소유가 아니어도 배포" '[ "$RC" -eq 0 ] && { [ "$(id -u)" = 0 ] || [ "$(owner_uid "$T/app/conf/config.env")" != 0 ]; }'
+check "배포는 unit 을 설치·활성화하지 않는다 (서버에 DevOps 가 둔다)" '[ -z "$(ls -A "$T/units")" ] && ! grep -Eq "^systemctl (enable|daemon-reload)" "$T/calls.log"'
+# deploy/systemd/ 는 서버 unit 의 참고본이다
+U="$REPO/deploy/systemd/argus-slack-bot.service"
+check "참고 unit: 시작 횟수 제한 없이 5초마다 재시작" 'grep -qx "StartLimitIntervalSec=0" "$U" && ! grep -q "^StartLimitBurst=" "$U" && grep -qx "RestartSec=5" "$U"'
+check "참고 unit: ExecStartPre 도 서비스 계정으로 (+ 없음)" 'grep -qx "ExecStartPre=/data/whatap/plugin/argus-slack-bot/current/deploy/load-secrets.sh" "$U" && ! grep -q "^ExecStartPre=[-@:!+]*+" "$U"'
+check "참고 unit: 서비스·백업의 설정 파일 = /data/whatap/plugin/argus-slack-bot/conf/config.env" 'grep -qx "EnvironmentFile=/data/whatap/plugin/argus-slack-bot/conf/config.env" "$U" && grep -qx "EnvironmentFile=/data/whatap/plugin/argus-slack-bot/conf/config.env" "$REPO/deploy/systemd/argus-slack-bot-backup.service"'
+check "옛 경로 /data/whatap/argus-slack-bot 이 배포 파일·문서에 남지 않는다" '! grep -rnF --exclude-dir=test "/data/whatap/argus-slack-bot" "$REPO/deploy" "$REPO/docs" "$REPO/README.md"'
 check "data·backups 디렉터리" '[ -d "$T/app/data" ] && [ -d "$T/app/backups" ]'
 
 : > "$T/calls.log"
 make_bundle r02
 deploy r02
 check "두 번째 배포 → r02" '[ "$RC" -eq 0 ] && [ "$(current)" = r02 ]'
-check "unit 이 같으면 daemon-reload 안 함" '! grep -q "daemon-reload" "$T/calls.log"'
+check "unit 을 건드리지 않으니 daemon-reload 안 함" '! grep -q "daemon-reload" "$T/calls.log"'
 check "재시작" 'grep -q "systemctl restart argus-slack-bot.service" "$T/calls.log"'
 
 # 헬스체크 실패 → 직전 release 로 자동 복귀, 실패한 release 는 지운다
@@ -294,66 +308,40 @@ check "보관 개수 3" '[ "$(find "$T/app/releases" -mindepth 1 -maxdepth 1 -ty
 check "current·직전 판 보관" '[ "$(current)" = r14 ] && [ -d "$T/app/releases/r14" ] && [ -d "$T/app/releases/r13" ]'
 
 run status
-check "status 출력" '[ "$RC" -eq 0 ] && grep -q "^CURRENT=r14" "$T/out.log" && grep -q "^ARCH=" "$T/out.log" && grep -q "^STATUS-OK" "$T/out.log"'
+check "status 출력" '[ "$RC" -eq 0 ] && grep -q "^CURRENT=r14" "$T/out.log" && grep -q "^ARCH=" "$T/out.log" && grep -q "^UNIT=present" "$T/out.log" && grep -q "^STATUS-OK" "$T/out.log"'
 ROOT="$T/nowhere/app"
 run status
 ROOT=""
 check "status: APP_ROOT 의 상위 디렉터리가 없어도 DISK_FREE_KB=unknown, STATUS-OK" '[ "$RC" -eq 0 ] && grep -q "^DISK_FREE_KB=unknown" "$T/out.log" && grep -q "^STATUS-OK" "$T/out.log"'
 
-# group 이 쓸 수 있는 APP_ROOT 에는 설치하지 않는다 (S3 를 부르기 전에 멈춘다)
+# 서비스 unit 은 서버에 미리 설치돼 있어야 한다. 없으면 S3 를 부르기 전에 멈춘다 (배포는 unit 을 설치하지 않는다)
 make_bundle r21
-chmod g+w "$T/app"
+touch "$T/state/no-unit"
 : > "$T/calls.log"
 deploy r21
-chmod g-w "$T/app"
-check "group 쓰기 가능한 APP_ROOT → UNSAFE-DIR, S3 다운로드 안 함" '[ "$RC" -ne 0 ] && grep -qF "DEPLOY-FAILED UNSAFE-DIR $T/app (" "$T/out.log" && ! grep -q "aws s3 cp" "$T/calls.log"'
-check "UNSAFE-DIR → current 그대로" '[ "$(current)" = r14 ] && [ ! -e "$T/app/releases/r21" ]'
-
-# 설정 디렉터리(conf/)와 config.env 도 다른 계정이 바꿀 수 없어야 한다 (S3 를 부르기 전에 멈춘다)
-make_bundle r23
-chmod g+w "$T/app/conf"
-: > "$T/calls.log"
-deploy r23
-chmod g-w "$T/app/conf"
-check "group 쓰기 가능한 conf/ → UNSAFE-DIR, S3 다운로드 안 함" '[ "$RC" -ne 0 ] && grep -qF "DEPLOY-FAILED UNSAFE-DIR $T/app/conf (" "$T/out.log" && ! grep -q "aws s3 cp" "$T/calls.log"'
-chmod g+w "$T/app/conf/config.env"
-: > "$T/calls.log"
-deploy r23
-chmod g-w "$T/app/conf/config.env"
-check "group 쓰기 가능한 config.env → UNSAFE-CONFIG, S3 다운로드 안 함" '[ "$RC" -ne 0 ] && grep -qF "DEPLOY-FAILED UNSAFE-CONFIG $T/app/conf/config.env (" "$T/out.log" && ! grep -q "aws s3 cp" "$T/calls.log"'
-chmod g+w "$T/app/conf/config.env"
+check "서비스 unit 없음 → UNIT-MISSING, S3 다운로드 안 함" '[ "$RC" -ne 0 ] && grep -qF "DEPLOY-FAILED UNIT-MISSING argus-slack-bot.service" "$T/out.log" && ! grep -q "aws s3 cp" "$T/calls.log"'
+check "UNIT-MISSING → current 그대로" '[ "$(current)" = r14 ] && [ ! -e "$T/app/releases/r21" ]'
 run rollback
-chmod g-w "$T/app/conf/config.env"
-check "group 쓰기 가능한 config.env → rollback 도 UNSAFE-CONFIG" '[ "$RC" -ne 0 ] && grep -qF "ROLLBACK-FAILED UNSAFE-CONFIG $T/app/conf/config.env (" "$T/out.log"'
-check "conf/·config.env 거부 → current 그대로" '[ "$(current)" = r14 ] && [ ! -e "$T/app/releases/r23" ]'
+check "서비스 unit 없음 → rollback 도 UNIT-MISSING, current 그대로" '[ "$RC" -ne 0 ] && grep -qF "ROLLBACK-FAILED UNIT-MISSING argus-slack-bot.service" "$T/out.log" && [ "$(current)" = r14 ]'
+run status
+check "서비스 unit 없음 → status 는 UNIT=missing 을 보여 주고 STATUS-OK" '[ "$RC" -eq 0 ] && grep -q "^UNIT=missing" "$T/out.log" && grep -q "^STATUS-OK" "$T/out.log"'
+rm -f "$T/state/no-unit"
 
-# 설정 경로가 심볼릭 링크면 가리키는 곳의 소유자를 본다. 시스템 파일(root 소유)을 다른 계정 소유로 쓰므로
-# root 가 아닌 사용자로 돌 때만 한다 (CI 와 개발 PC). 링크만 지우고 가리키는 파일은 건드리지 않는다.
-if [ "$REAL_UID" != 0 ]; then
-  mv "$T/app/conf/config.env" "$T/app/conf/config.env.real"
-  ln -s /etc/hosts "$T/app/conf/config.env"
-  run rollback
-  rm "$T/app/conf/config.env"
-  mv "$T/app/conf/config.env.real" "$T/app/conf/config.env"
-  check "config.env 가 다른 계정 소유 파일로 가는 링크 → UNSAFE-CONFIG" '[ "$RC" -ne 0 ] && grep -qF "ROLLBACK-FAILED UNSAFE-CONFIG $T/app/conf/config.env (0 " "$T/out.log" && [ "$(current)" = r14 ]'
-  ln -s /etc "$T/app/etc-link"
-  CFG="$T/app/etc-link/hosts"
-  run rollback
-  CFG=""
-  rm "$T/app/etc-link"
-  check "설정 디렉터리가 다른 계정 소유 디렉터리로 가는 링크 → UNSAFE-DIR" '[ "$RC" -ne 0 ] && grep -qF "ROLLBACK-FAILED UNSAFE-DIR $T/app/etc-link (0 " "$T/out.log" && [ "$(current)" = r14 ]'
-fi
+# 소유·권한은 서버 규칙(whatap 소유)을 따르고 배포는 검사하지 않는다: group 이 쓸 수 있는 conf/·config.env 여도 배포한다
+make_bundle r23
+chmod g+w "$T/app" "$T/app/conf" "$T/app/conf/config.env"
+deploy r23
+chmod g-w "$T/app" "$T/app/conf" "$T/app/conf/config.env"
+check "소유·권한 검사 없음 → 배포" '[ "$RC" -eq 0 ] && grep -q "^DEPLOY-OK release=r23" "$T/out.log" && ! grep -q "UNSAFE" "$T/out.log"'
 
-# APP_ROOT 의 상위가 다른 디스크로 가는 심볼릭 링크여도 된다: 링크 자체가 아니라 가리키는 디렉터리를 검사한다.
-# 리눅스 심볼릭 링크는 늘 777 이라 macOS 에서도 같게 umask 000 으로 만든다.
+# APP_ROOT 의 상위가 다른 디스크로 가는 심볼릭 링크여도 된다
 mkdir -p "$T/real"
-chmod 755 "$T/real"  # 부른 쪽 umask(예: 002)와 상관없이 group 쓰기 없는 디렉터리
 (umask 000 && ln -s "$T/real" "$T/lnk")
 make_bundle r22
 ROOT="$T/lnk/app"
 deploy r22
 ROOT=""
-check "APP_ROOT 의 상위가 심볼릭 링크 → 가리키는 디렉터리로 검사해 배포" '[ "$RC" -eq 0 ] && grep -q "^DEPLOY-OK release=r22" "$T/out.log" && ! grep -q "UNSAFE-DIR" "$T/out.log"'
+check "APP_ROOT 의 상위가 심볼릭 링크 → 배포" '[ "$RC" -eq 0 ] && grep -q "^DEPLOY-OK release=r22" "$T/out.log"'
 
 # 묶음의 코드는 root 로 실행하지 않는다
 check "묶음의 node 는 늘 runuser 로 서비스 계정이 실행" '[ -s "$T/node.log" ] && ! grep -qv " runuser=whatap$" "$T/node.log"'

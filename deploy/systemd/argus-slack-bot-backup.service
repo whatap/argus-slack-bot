@@ -1,14 +1,15 @@
 [Unit]
 Description=argus-slack-bot SQLite backup
 Documentation=https://github.com/whatap/argus-slack-bot/blob/main/docs/deploy-aws.md
+# 서버에 DevOps 가 설치한다 (.timer 와 함께). 배포 스크립트는 unit 을 설치·교체하지 않는다 (이 파일은 참고본).
 
 [Service]
 Type=oneshot
 User=whatap
 Group=whatap
-EnvironmentFile=/data/whatap/argus-slack-bot/conf/config.env
+EnvironmentFile=/data/whatap/plugin/argus-slack-bot/conf/config.env
 Environment=HOME=/tmp
-ExecStart=/data/whatap/argus-slack-bot/current/deploy/backup.sh
+ExecStart=/data/whatap/plugin/argus-slack-bot/current/deploy/backup.sh
 Nice=10
 IOSchedulingClass=idle
 UMask=0077
@@ -16,4 +17,4 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/data/whatap/argus-slack-bot/data /data/whatap/argus-slack-bot/backups
+ReadWritePaths=/data/whatap/plugin/argus-slack-bot/data /data/whatap/plugin/argus-slack-bot/backups
