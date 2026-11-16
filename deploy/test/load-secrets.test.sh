@@ -108,7 +108,7 @@ check "변환 결과가 비면 → 임시 파일 남기지 않음" 'tmp_cleaned'
 
 # 설정이 빠지면 넣을 파일 위치를 알려 준다
 run "$(secret_json)" 0 ASB_SECRETS_ID
-check "ASB_SECRETS_ID 가 없으면 → 실패, conf/config.env 에 넣으라고 알림" '[ "$RC" -ne 0 ] && grep -qF "ASB_SECRETS_ID 가 /data/whatap/argus-slack-bot/conf/config.env 에 필요해요" "$T/out.log"'
+check "ASB_SECRETS_ID 가 없으면 → 실패, conf/config.env 에 넣으라고 알림" '[ "$RC" -ne 0 ] && grep -qF "ASB_SECRETS_ID 가 /data/whatap/plugin/argus-slack-bot/conf/config.env 에 필요해요" "$T/out.log"'
 
 echo "# pass=$PASSES fail=$FAILS"
 [ "$FAILS" -eq 0 ]
