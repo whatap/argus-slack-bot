@@ -434,9 +434,11 @@ export function loadWhatapOAuthSettings(
   }
   // 사용자 토큰은 와탭 로그인 서버(front)에만 보낸다. Argus 는 front 의 /argus 뒤에 있고,
   // front 가 경로마다 scope 를 확인한 뒤 넘긴다. Argus 를 직접 가리키면 그 확인을 건너뛰므로 시작하지 않는다.
+  // 요청 주소는 `${ARGUS_URL}/v1/...` 로 이어 붙이므로 정확히 그 주소여야 한다 — 빈 `?`·`#` 는 경로를 query·fragment 로
+  // 밀어내고, 주소에 넣은 계정(user:pass@)은 요청마다 실려 나간다.
   const argusUrl = new URL(env.ARGUS_URL);
   const issuerOrigin = new URL(env.WHATAP_OAUTH_ISSUER as string).origin;
-  if (argusUrl.origin !== issuerOrigin || argusUrl.pathname !== "/argus" || argusUrl.search || argusUrl.hash) {
+  if (argusUrl.href !== `${issuerOrigin}/argus` || argusUrl.username || argusUrl.password) {
     throw new Error(`와탭 로그인 모드의 ARGUS_URL 은 와탭 로그인 서버(front)의 /argus 여야 해요: ${issuerOrigin}/argus`);
   }
   const redirect = new URL(env.WHATAP_OAUTH_REDIRECT_URI as string);

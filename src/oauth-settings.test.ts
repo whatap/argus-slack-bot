@@ -45,6 +45,9 @@ test("사용자 토큰은 front 로만 간다: ARGUS_URL 은 로그인 서버와
     "http://localhost:18080", // 경로 없음
     "http://localhost:18080/argus/", // 끝 슬래시 — `${ARGUS_URL}/v1/...` 가 // 가 된다
     "http://localhost:18080/argus?x=1",
+    "http://localhost:18080/argus?", // 빈 query — `${ARGUS_URL}/v1/...` 의 경로가 query 로 들어간다
+    "http://localhost:18080/argus#", // 빈 fragment — 경로가 fragment 로 빠져 /argus 만 불린다
+    "http://user:pass@localhost:18080/argus", // 주소에 넣은 계정 — 요청마다 실려 나간다
   ]) {
     assert.throws(() => loadWhatapOAuthSettings({ ...FULL, ARGUS_URL: wrong }), /http:\/\/localhost:18080\/argus/, wrong);
   }

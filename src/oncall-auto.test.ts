@@ -108,8 +108,12 @@ test("자동 대응 대상은 규칙 이름에 설정한 부분 문자열 중 �
 });
 
 // argus 의 OPM 조치안 chip(applyOpmAction). 위험도는 argus 가 붙이고, 대상 서버는 oid·oname 으로 온다.
-const opm = (over: Record<string, unknown> = {}) => ({ type: "applyOpmAction", label: "디스크 정리",
-  payload: { confirmToken: "oa_1", tool: "operant_action", risk: "warning", pcode: 42, oid: 1234, oname: "web-01", title: "디스크 정리", ...over } });
+// OPM 에 실제로 보낼 인자(arguments)도 실린다 — 카탈로그 조치는 함수·프로젝트·oid·파라미터다(argus opmaction contract).
+const opm = (over: Record<string, unknown> = {}) => {
+  const payload: Record<string, unknown> = { confirmToken: "oa_1", tool: "operant_action", risk: "warning", pcode: 42, oid: 1234, oname: "web-01", title: "디스크 정리", ...over };
+  if (!("arguments" in over)) payload["arguments"] = { function: "disk_cleanup", pcode: payload["pcode"], oid: payload["oid"], params: { path: "/app/logs" } };
+  return { type: "applyOpmAction", label: "디스크 정리", payload };
+};
 /** 알림이 가리키는 서버: 프로젝트 코드와 서버 oid(알림에 적혀 있을 때만). */
 const target = { project: "42", oid: "1234" };
 
@@ -141,7 +145,60 @@ test("알림에 서버 oid 가 없거나, 조치안이 다른 서버·다른 프
     assert.deepEqual(picked.manual, [chip]);
   }
   assert.ok(pickAutoOpm([opm({ oid: "1234", pcode: "42" })], target, risks).auto, "문자열로 와도 같은 서버다");
-  assert.ok(pickAutoOpm([opm({ oid: -1725776847 })], { project: "42", oid: "-1725776847" }, risks).auto, "음수 oid 도 그대로 비교한다");
+  assert.ok(pickAutoOpm([opm({ oid: -1234567890 })], { project: "42", oid: "-1234567890" }, risks).auto, "음수 oid 도 그대로 비교한다");
+});
+
+// 사람 없이 실행해도 되는 것은 카탈로그 조치(operant_action)와 Argus 가 고정한 스크립트(operant_execute)뿐이다. Job 등록·삭제·배포와
+// 범용 OPM API 는 실제 대상이 인자(agents·path·body)에 있어, 위험도 표시와 chip 의 oid 가 맞아 보여도 무엇을 건드리는지 알 수 없다.
+test("자동 실행은 카탈로그 조치와 고정 스크립트뿐이고, Job·배포·범용 API·모르는 도구는 위험도·대상이 맞아도 사람 버튼으로 남는다", () => {
+  const all = ["normal", "warning", "critical"] as const;
+  const onServer = { pcode: 42, oid: 1234 };
+  for (const [tool, args] of [
+    ["operant_jobs_create", { ...onServer, jobName: "cleanup", triggerType: "CRON", triggerValue: "0 * * * *", script: { content: "rm -rf /tmp/x" } }],
+    ["operant_jobs_delete", { ...onServer, jobId: "job-1" }],
+    ["operant_deploy_activate", { ...onServer, jobId: "job-1" }],
+    ["operant_deploy_deactivate", { ...onServer, jobId: "job-1" }],
+    ["operant_api_request", { ...onServer, method: "POST", path: "/api/agents/restart", body: { force: true } }],
+    ["operant_something_new", onServer],
+    ["", onServer],
+    [undefined, onServer],
+  ] as const) {
+    const chip = opm({ tool, risk: "normal", arguments: args });
+    const picked = pickAutoOpm([chip], target, all);
+    assert.equal(picked.auto, undefined, String(tool));
+    assert.deepEqual(picked.manual, [chip], `${String(tool)}: 사람 버튼으로 남는다`);
+  }
+  assert.ok(pickAutoOpm([opm({ tool: "operant_action", risk: "normal" })], target, all).auto, "카탈로그 조치");
+  assert.ok(pickAutoOpm([opm({ tool: "operant_execute", arguments: { ...onServer, scriptContent: "df -h" } })], target, all).auto,
+    "고정 스크립트는 critical 이라 운영자가 critical 까지 허용했을 때만");
+});
+
+// chip 의 oid 는 보여 주는 값이고, OPM 에 가는 것은 arguments 다. 인자가 가리키는 서버가 알림의 서버 하나가 아니면 사람이 누른다.
+test("조치안 인자가 알림의 서버 밖을 가리키면(다른 oid·여러 서버·대상 목록·다른 프로젝트·oid 없음) 자동으로 실행하지 않는다", () => {
+  const risks = ["normal", "warning"] as const;
+  const args = (extra: Record<string, unknown> = {}) => ({ function: "disk_cleanup", pcode: 42, oid: 1234, params: { path: "/app/logs" }, ...extra });
+  for (const [name, a] of [
+    ["다른 oid", args({ oid: 999 })],
+    ["oid 없음(프로젝트 단위 조치)", { function: "disk_cleanup", pcode: 42 }],
+    ["다른 프로젝트", args({ pcode: 43 })],
+    ["여러 프로젝트(pcodes)", args({ pcodes: [42, 43] })],
+    ["프로젝트 없음", { function: "disk_cleanup", oid: 1234 }],
+    ["여러 서버(oids)", args({ oids: [1234, 999] })],
+    ["oid 목록", args({ oid: [1234, 999] })],
+    ["대상 에이전트 목록", args({ agents: [{ pcode: 42, oid: 1234 }, { pcode: 42, oid: 999 }] })],
+    ["다른 프로젝트의 같은 oid", args({ agents: [{ pcode: 43, oid: 1234 }] })],
+    ["oid 없는 대상", args({ targets: [{ pcode: 42, oname: "web-02" }] })],
+    ["파라미터 속 다른 에이전트", args({ params: { path: "/app/logs", agentOid: "999" } })],
+    ["인자 없음", undefined],
+  ] as const) {
+    const chip = opm({ arguments: a });
+    const picked = pickAutoOpm([chip], target, risks);
+    assert.equal(picked.auto, undefined, name);
+    assert.deepEqual(picked.manual, [chip], `${name}: 사람 버튼으로 남는다`);
+  }
+  assert.ok(pickAutoOpm([opm({ arguments: args({ oid: "1234", pcode: "42", params: { path: "/app/logs", targetOid: "1234" } }) })], target, risks).auto,
+    "알림의 서버만 가리키면 실행한다");
+  assert.ok(pickAutoOpm([opm({ arguments: args({ agents: [{ pcode: 42, oid: 1234 }] }) })], target, risks).auto, "대상 목록이 알림의 서버 하나뿐이면 실행한다");
 });
 
 /** 시계와 타이머를 손으로 돌린다. 콜백이 돌려준 promise 까지 기다린다. */
@@ -236,6 +293,35 @@ test("해소되면 에스컬레이션을 멈추고, 자동 조치 뒤 얼마 만
   assert.equal(calls, 0);
   assert.deepEqual(incidents.resolve("200.000001"), { owner: "U2" }, "자동 조치 없이 해소");
   assert.equal(incidents.resolve("300.000001"), undefined, "자동 대응하지 않은 사건");
+});
+
+// 분석은 1분 넘게 걸릴 수 있다. 그사이 해소(RECOVERED)·닫힘(DISABLED) 알림이 오면 그 뒤 답의 조치안은 자동으로 실행하지 않는다.
+test("해소·닫힘이 먼저 온 사건은 자동 조치를 하지 않고, 에스컬레이션도 걸지 않는다", async () => {
+  const clock = fakeClock();
+  const incidents = new OncallIncidents(clock);
+  incidents.claim("100.000001", "U1");
+  assert.deepEqual(incidents.resolve("100.000001"), { owner: "U1" });
+  assert.equal(incidents.tryApply("100.000001", "oa_a"), false, "해소된 사건");
+  let calls = 0;
+  incidents.applied("100.000001", 10 * 60_000, () => { calls++; });
+  assert.equal(clock.pending(), 0, "에스컬레이션 타이머를 걸지 않는다");
+  await clock.advance(60 * 60_000);
+  assert.equal(calls, 0);
+  assert.equal(incidents.resolved("100.000001"), true, "왜 실행하지 않았는지 기록에 남길 수 있다");
+  assert.equal(incidents.resolved("200.000001"), false, "모르는 사건");
+});
+
+test("자동 조치 요청을 보내는 사이 해소되면, 실행 결과가 와도 에스컬레이션을 걸지 않는다", async () => {
+  const clock = fakeClock();
+  const incidents = new OncallIncidents(clock);
+  incidents.claim("100.000001", "U1");
+  assert.equal(incidents.tryApply("100.000001", "oa_a"), true);
+  incidents.resolve("100.000001");
+  let calls = 0;
+  incidents.applied("100.000001", 10 * 60_000, () => { calls++; });
+  assert.equal(clock.pending(), 0);
+  await clock.advance(60 * 60_000);
+  assert.equal(calls, 0);
 });
 
 test("하루가 지나 잊은 사건의 에스컬레이션은 부르지 않는다 — 해소 알림도 더는 그 사건과 잇지 못한다", async () => {
@@ -349,4 +435,22 @@ test("한 당번의 알림이 실패해도 다른 당번의 토큰 유지는 이
   await keepAlive.tick();
   assert.deepEqual(refreshed, ["T1:U1", "T2:U2"]);
   assert.match(logs.join("\n"), /owner=U1 step=keepalive result=notify-failed/);
+});
+
+// 타이머에서 거절된 promise 는 아무도 받지 않는다 — Node 22 는 그런 거절(unhandled rejection)에 프로세스를 끝낸다.
+test("당번 목록을 읽지 못해도(DB 오류) 토큰 유지 주기는 거절로 끝나지 않고 기록만 남기며, 다음 주기에 다시 한다", async () => {
+  const clock = fakeClock();
+  const logs: string[] = [];
+  let reads = 0;
+  const keepAlive = new OncallKeepAlive({
+    timers: clock, everyMs: 60 * 60_000,
+    owners: () => { reads++; throw new Error("SQLITE_BUSY: database is locked"); },
+    refresh: async () => undefined, notifyExpired: async () => undefined, log: (line) => logs.push(line),
+  });
+  await keepAlive.tick();
+  keepAlive.start();
+  await clock.advance(60 * 60_000);
+  assert.equal(reads, 2, "다음 주기에도 다시 읽는다");
+  assert.equal(logs.length, 2);
+  assert.match(logs[0], /^\[argus-slack-bot\] oncall at=\S+ team=- channel=- root=- owner=- step=keepalive result=error reason=SQLITE_BUSY/);
 });

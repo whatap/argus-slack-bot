@@ -23,6 +23,26 @@ test("expired or over-capacity state cannot be reused as a new incident", () => 
   assert.equal(threads.observe(parse()!, `${Math.floor(now / 1000)}.000001`, "B1")?.kind, "offer");
 });
 
+// Alerts that keep arriving while the tracker is full must not keep it closed: once an old entry expires, new alerts are
+// tracked again. An occurrence refused while full stays refused while its first root is fresh (it may recur as a second root).
+test("a full tracker resumes as soon as an expired entry frees space, however many alerts arrived meanwhile", () => {
+  const hour = 60 * 60 * 1000;
+  let now = Date.now();
+  const at = () => `${Math.floor(now / 1000)}.000001`;
+  const archive = (id: number) => parse(body.replace("archiveId=17", `archiveId=${id}`))!;
+  const threads = new AlertThreads(() => now, 1);
+  assert.equal(threads.observe(archive(17), at(), "B1")?.kind, "offer");
+  for (let id = 18; id <= 40; id++) {
+    now += hour;
+    assert.equal(threads.observe(archive(id), at(), "B1"), undefined, `full at hour ${id - 17}`);
+  }
+  now += hour + 60_000; // archive 17 is now more than a day old and leaves the tracker
+  assert.equal(threads.observe(archive(40), at(), "B1"), undefined, "a refused occurrence is not admitted later as a new root");
+  assert.equal(threads.observe(archive(99), at(), "B1")?.kind, "offer", "a new alert is tracked again");
+  now += 1000;
+  assert.equal(threads.observe(archive(100), at(), "B1"), undefined, "and the tracker is full again");
+});
+
 test("source requires a full explicit bundle of IDs (never names or wildcards)", () => {
   const env = { SLACK_ALERT_TEAM_ID: "T1", SLACK_ALERT_CHANNEL_ID: "C1", SLACK_ALERT_BOT_IDS: "B1, B2" };
   assert.deepEqual([...alertSource(env)!.bots], ["B1", "B2"]);
@@ -170,7 +190,7 @@ test("the alert level becomes the contract's verdict word; only Critical and War
 });
 test("an oid written in the event message reaches the target row; none, zero or two different ones mean unknown (0)", () => {
   for (const [message, oid] of [
-    ["CPU = 97% (oid 1234)", 1234], ["oid=-1725776847 CPU = 97%", -1725776847], ["CPU 97%, OID: 77", 77], ["oid 9 … oid 9", 9],
+    ["CPU = 97% (oid 1234)", 1234], ["oid=-1234567890 CPU = 97%", -1234567890], ["CPU 97%, OID: 77", 77], ["oid 9 … oid 9", 9],
     ["CPU = 97%", 0], ["oid 0", 0], ["void 12", 0], ["android 5", 0], ["oid abc", 0], ["oid 12x", 0], ["oid 12 oid 34", 0],
   ] as const) {
     const got = readIncident(incidentPrompt(alertWith({ message })!))!;
@@ -216,6 +236,16 @@ test("a Webhook JSON alert carries the server oid and the event's start in the c
   assert.equal(got.ref, "2026-11-18 21:02");
   assert.deepEqual(got.targets.map((t) => [t.oname, t.oid]), [["test-target", 987654321]]);
   assert.equal(readAlert(wj()), undefined, "epoch times are not rendered without a configured zone");
+});
+// Unattended action trusts only the structured field. An oid written in the event message (free text by whoever wrote the
+// rule, or forged in an alert body) still reaches the analysis text, but it never names the server to act on.
+test("only the Webhook JSON 서버 oid field names the server for unattended action; an oid in the event message does not", () => {
+  const template = alertWith({ message: "CPU = 97% (oid 1234)" })!;
+  assert.equal(template.oid, "1234", "the analysis text still carries it");
+  assert.equal(template.serverOid, undefined);
+  assert.equal(readAlert(wj(), "Asia/Seoul")?.serverOid, "987654321");
+  assert.equal(readAlert(wj({ oid: "-1234567890" }), "Asia/Seoul")?.serverOid, "-1234567890");
+  assert.equal(readAlert(wj({ oid: "", message: "cpu 0.85 (oid 1234)" }), "Asia/Seoul")?.serverOid, undefined, "a JSON message is free text too");
 });
 test("Webhook JSON off closes its own event once with the event's end time; an off without one says so", () => {
   const now = Math.floor(Date.now() / 1000) - 10, zone = "Asia/Seoul", root = `${now}.000001`;

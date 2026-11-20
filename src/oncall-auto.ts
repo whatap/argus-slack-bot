@@ -79,14 +79,50 @@ export interface OpmPick {
 }
 
 /**
- * 자동 대응 답의 chip 을 자동 실행 하나와 나머지로 나눈다. 자동 실행은 OPM 조치안 가운데 위험도가 risks 안에 있고,
- * 알림이 가리키는 서버(같은 프로젝트의 같은 oid)를 겨냥한 첫 번째 것뿐이다. 알림에 oid 가 없으면 아무것도 자동이 아니다.
+ * 사람 확인 없이 실행해도 되는 OPM 도구 — 카탈로그 조치(operant_action)와 Argus 가 고정한 스크립트(operant_execute)뿐이다.
+ * Job 등록·삭제·배포와 범용 OPM API, 모르는 도구는 실제 대상이 인자(agents·path·body)에 있어 늘 사람이 누른다.
+ */
+const AUTO_TOOLS: ReadonlySet<string> = new Set(["operant_action", "operant_execute"]);
+
+/**
+ * 인자에서 서버(에이전트)를 가리키는 칸 — OPM 계약의 oid·agents(배포 대상)와 그 비슷한 이름(oids·agentOid·targets…).
+ * 넓게 잡는다: 이름이 겹쳐 잘못 걸리면 자동 실행 대신 당번 버튼으로 남을 뿐이다.
+ */
+const SERVER_KEY = /oid|^agent|^targets?$|^servers?$/i;
+
+/**
+ * OPM 에 갈 인자가 가리키는 서버가 알림의 서버(같은 프로젝트의 같은 oid) 하나뿐인지. 서버를 가리키는 칸은 어디에 있든(params 안,
+ * 목록 안) 그 oid 여야 하고, 프로젝트 칸(pcode)은 알림의 프로젝트여야 한다. 대상 목록의 항목이 객체면 oid 로 서버를 밝혀야 한다.
+ */
+function namesOnly(value: unknown, server: { project: string; oid: string }, key = ""): boolean {
+  if (Array.isArray(value)) return value.every((v) => namesOnly(v, server, key));
+  if (value !== null && typeof value === "object") {
+    const entries = Object.entries(value);
+    if (SERVER_KEY.test(key) && !entries.some(([k]) => /oid/i.test(k))) return false;
+    return entries.every(([k, v]) => namesOnly(v, server, k));
+  }
+  if (/^pcodes?$/i.test(key)) return String(value) === server.project;
+  return !SERVER_KEY.test(key) || String(value) === server.oid;
+}
+
+/**
+ * 자동 대응 답의 chip 을 자동 실행 하나와 나머지로 나눈다. 자동 실행은 카탈로그 조치·고정 스크립트 조치안 가운데 위험도가 risks
+ * 안에 있고, 알림이 가리키는 서버(같은 프로젝트의 같은 oid)를 겨냥한 첫 번째 것뿐이다. chip 의 대상(oid·pcode)과 OPM 에 갈
+ * 인자(arguments)가 모두 그 서버여야 한다. 알림에 oid 가 없으면 아무것도 자동이 아니다.
  */
 export function pickAutoOpm(chips: ChipAction[], target: { project: string; oid?: string }, risks: readonly OpmRisk[]): OpmPick {
   // 알림이 서버 oid 를 모르면 어느 조치안이 그 서버를 겨냥하는지 알 수 없다 — 모두 사람이 누른다.
-  const sameServer = (p: Record<string, unknown>) => target.oid !== undefined &&
-    String(p["oid"] ?? "") === target.oid && String(p["pcode"] ?? "") === target.project;
-  const auto = chips.find((c) => c.type === OPM_CHIP_TYPE && typeof c.payload["confirmToken"] === "string" && c.payload["confirmToken"] !== "" &&
+  const sameServer = (p: Record<string, unknown>) => {
+    if (target.oid === undefined) return false;
+    const server = { project: target.project, oid: target.oid };
+    const args = p["arguments"];
+    return String(p["oid"] ?? "") === server.oid && String(p["pcode"] ?? "") === server.project &&
+      args !== null && typeof args === "object" && !Array.isArray(args) &&
+      String((args as Record<string, unknown>)["oid"] ?? "") === server.oid &&
+      String((args as Record<string, unknown>)["pcode"] ?? "") === server.project && namesOnly(args, server);
+  };
+  const auto = chips.find((c) => c.type === OPM_CHIP_TYPE && AUTO_TOOLS.has(String(c.payload["tool"] ?? "")) &&
+    typeof c.payload["confirmToken"] === "string" && c.payload["confirmToken"] !== "" &&
     risks.includes(riskOf(c.payload)) && sameServer(c.payload));
   return { auto, manual: chips.filter((c) => c !== auto) };
 }
@@ -196,6 +232,8 @@ interface Incident {
   /** 자동으로 실행한 시각(봇 시계). */
   appliedAt?: number;
   escalation?: unknown;
+  /** 해소(RECOVERED)·닫힘(DISABLED) 알림이 왔다. 그 뒤로는 자동 조치도 에스컬레이션도 하지 않는다. */
+  resolved?: boolean;
 }
 
 /** 자동 대응한 사건(알림 원본 글 ts 마다)의 상태 — 한 번만 분석, 자동 조치는 하나, 에스컬레이션 타이머. 메모리에만 둔다. */
@@ -219,19 +257,19 @@ export class OncallIncidents {
     return true;
   }
 
-  /** 이 사건에서 이 확인 토큰을 자동으로 실행해도 되면 표시하고 true. */
+  /** 이 사건에서 이 확인 토큰을 자동으로 실행해도 되면 표시하고 true. 해소·닫힌 사건이면 false. */
   tryApply(root: string, token: string): boolean {
     const incident = this.incidents.get(root);
     // 같은 확인 토큰은 어느 사건에서든 다시 실행하지 않는다(사건 기록이 남아 있는 하루 동안 — argus 토큰은 그 전에 만료된다).
-    if (!incident || incident.token !== undefined || [...this.incidents.values()].some((i) => i.token === token)) return false;
+    if (!incident || incident.resolved || incident.token !== undefined || [...this.incidents.values()].some((i) => i.token === token)) return false;
     incident.token = token;
     return true;
   }
 
-  /** 자동 조치를 실행했다. escalateMs 안에 해소(resolve)되지 않으면 onEscalate 를 한 번 부른다. */
+  /** 자동 조치를 실행했다. escalateMs 안에 해소(resolve)되지 않으면 onEscalate 를 한 번 부른다. 이미 해소·닫힌 사건이면 걸지 않는다. */
   applied(root: string, escalateMs: number, onEscalate: () => unknown): void {
     const incident = this.incidents.get(root);
-    if (!incident) return;
+    if (!incident || incident.resolved) return;
     incident.appliedAt = this.timers.now();
     const timer = this.timers.setTimeout(() => {
       incident.escalation = undefined;
@@ -241,15 +279,24 @@ export class OncallIncidents {
     incident.escalation = timer;
   }
 
-  /** 사건이 해소됐다. 에스컬레이션을 멈추고, 자동 대응한 사건이면 당번과 자동 조치 뒤 지난 시간(봇 시계)을 돌려준다. */
+  /**
+   * 사건이 해소(RECOVERED)되거나 닫혔다(DISABLED). 그렇게 기록해 그 뒤의 자동 조치·에스컬레이션을 막고, 걸려 있는 에스컬레이션을
+   * 멈춘다. 자동 대응한 사건이면 당번과 자동 조치 뒤 지난 시간(봇 시계)을 돌려준다.
+   */
   resolve(root: string): { owner: string; appliedAgoMs?: number } | undefined {
     const incident = this.incidents.get(root);
     if (!incident) return undefined;
+    incident.resolved = true;
     if (incident.escalation !== undefined) this.timers.clearTimeout(incident.escalation);
     incident.escalation = undefined;
     return incident.appliedAt === undefined
       ? { owner: incident.owner }
       : { owner: incident.owner, appliedAgoMs: this.timers.now() - incident.appliedAt };
+  }
+
+  /** 해소·닫힘 알림이 이미 온 사건인지(자동 조치를 하지 않은 까닭을 기록할 때). */
+  resolved(root: string): boolean {
+    return this.incidents.get(root)?.resolved === true;
   }
 }
 
@@ -299,9 +346,18 @@ export class OncallKeepAlive {
     timer.unref?.();
   }
 
-  /** 한 주기. 실패해도 다음 당번·다음 주기는 이어 간다(던지지 않는다). */
+  /** 한 주기. 실패해도 다음 당번·다음 주기는 이어 간다(던지지 않는다 — 타이머의 거절은 받을 곳이 없어 프로세스가 끝난다). */
   async tick(): Promise<void> {
-    for (const o of this.deps.owners()) {
+    let owners: OncallOwner[];
+    try {
+      owners = this.deps.owners();
+    } catch (err) {
+      // 당번 목록(SQLite)을 읽지 못했다. 이번 주기는 건너뛰고 다음 주기에 다시 읽는다.
+      const reason = (err instanceof Error ? err.message : String(err)).slice(0, 200);
+      this.deps.log(oncallLog({ team: "-", channel: "-", owner: "-", step: "keepalive", result: "error", reason }, this.deps.timers.now()));
+      return;
+    }
+    for (const o of owners) {
       const key = JSON.stringify([o.teamId, o.channelId, o.ownerId]);
       const line = (result: string) => this.deps.log(oncallLog({ team: o.teamId, channel: o.channelId, owner: o.ownerId, step: "keepalive", result }, this.deps.timers.now()));
       try {

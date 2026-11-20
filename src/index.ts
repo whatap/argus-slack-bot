@@ -74,6 +74,7 @@ import {
   renderOpmProposal,
   replaceOpmRow,
   riskOf,
+  type OpmChipOwner,
   type OpmOp,
 } from "./opm-action-chips.js";
 import {
@@ -291,6 +292,8 @@ async function main() {
     : null;
   // OPM 조치안의 확인 토큰 — 버튼에는 손잡이만 싣고 토큰은 여기(메모리)에만 둔다.
   const opmChips = new OpmChipStore();
+  // 와탭 로그인 모드의 알림 규칙 [적용]/[취소] 확인 토큰도 같은 방식으로 둔다(물어본 사람에게 묶인다).
+  const ruleChips = new OpmChipStore();
   console.log(
     `[argus-slack-bot] token DB: ${USER_TOKENS_DB} encryption: ${
       tokenStore.isEncrypted() ? "enabled (AES-256-GCM)" : "DISABLED (plaintext)"
@@ -380,6 +383,26 @@ async function main() {
     : undefined;
   const oncallLine = (fields: { root?: string; owner: string; step: string; [key: string]: string | number | undefined }) =>
     oncall && console.log(oncallLog({ ...fields, team: oncall.source.team, channel: oncall.source.channel }, systemTimers.now()));
+  /**
+   * 그 당번으로 지금도 자동 대응이 켜져 있지 않으면 그 까닭 — 앱이 지워졌거나(inactive) 누가 껐거나 다른 사람이 당번이 됐다(disarmed).
+   * 멈춤 스위치는 진행 중인 것도 멈춘다: 분석이 끝난 뒤의 자동 조치와 걸려 있던 에스컬레이션도 실행 직전에 이것을 다시 본다.
+   */
+  const oncallOff = (owner: string): "inactive" | "disarmed" | undefined => {
+    if (!oncall) return "disarmed";
+    if (!isWorkspaceActive(oncall.source.team)) return "inactive";
+    return oncall.owners.get(oncall.source.team, oncall.source.channel) === owner ? undefined : "disarmed";
+  };
+  /**
+   * 자동 대응을 못 하게 됐을 때의 대체 경로에서 쓰는 Slack 호출(당번 부르기·로그인 링크). 실패해도(예: 당번이 채널에 없어
+   * user_not_in_channel) 기록만 남기고 다음 단계를 잇는다 — 약속한 [분석] 버튼을 붙이고, 부르기로 한 당번은 부른다.
+   */
+  const oncallTry = async (what: string, root: string, call: () => Promise<unknown>) => {
+    try {
+      await call();
+    } catch (err) {
+      console.warn(`[argus-slack-bot] oncall ${what} failed root=${root}: ${String(err)}`);
+    }
+  };
 
   /** 알림 채널에서 받은 자동 대응 명령. 켜기는 와탭 토큰이 살아 있는 사람만, 끄기는 누구나(멈춤 스위치)다. */
   const runOncallCommand = async (command: "on" | "off" | "status", ctx: { userId: string; threadTs?: string; client: OncallSlack }) => {
@@ -804,7 +827,10 @@ async function main() {
       // 자동 대응이면 자동으로 실행할 조치안 하나를 버튼에서 뺀다(나머지 버튼은 당번만 누를 수 있다).
       opmPick = params.opmAuto?.pick(result.chipActions ?? []);
       const chipBlocks = [
-        ...(whatapLogin || creds?.argusCookie ? chipActionsToBlocks(result.chipActions) : []),
+        // 와탭 로그인 모드에서는 확인 토큰을 봇에 두고 버튼은 물어본 사람에게 묶는다(OPM 조치안과 같다).
+        ...(whatapLogin || creds?.argusCookie
+          ? chipActionsToBlocks(result.chipActions, whatapLogin ? { owner: { teamId, userId }, store: ruleChips } : undefined)
+          : []),
         // OPM 조치는 와탭 로그인 모드에서만 — 누른 사람의 토큰으로 front 를 거쳐 실행한다.
         ...(whatapLogin ? opmChipBlocks(opmPick?.manual ?? result.chipActions ?? [], { teamId, userId }, opmChips) : []),
       ];
@@ -923,14 +949,14 @@ async function main() {
     } catch (err) {
       const login = err instanceof LoginRequiredError;
       oncallLine({ root, owner, step: "skipped", reason: login ? "login-required" : "token-error" });
-      await client.chat.postMessage({ channel, thread_ts: root, text: login
+      await oncallTry("owner notice", root, () => client.chat.postMessage({ channel, thread_ts: root, text: login
         ? `<@${owner}> 와탭 로그인이 필요해 자동 대응을 하지 못했어요. 로그인 링크를 보냈어요. 아래 [분석] 버튼으로 누구든 이어서 분석할 수 있어요.`
-        : `<@${owner}> 와탭 로그인 서버에 닿지 않아 자동 대응을 하지 못했어요. 아래 [분석] 버튼으로 누구든 이어서 분석할 수 있어요.` });
+        : `<@${owner}> 와탭 로그인 서버에 닿지 않아 자동 대응을 하지 못했어요. 아래 [분석] 버튼으로 누구든 이어서 분석할 수 있어요.` }));
       if (login) {
-        await sendWhatapLoginLink(oncall.login, {
+        await oncallTry("login link", root, () => sendWhatapLoginLink(oncall.login, {
           teamId: team, userId: owner, isDm: false, channel, threadTs: root,
           say: (args) => client.chat.postMessage({ channel, text: args.text, thread_ts: args.thread_ts }), client,
-        }, ONCALL_EXPIRED_LEAD);
+        }, ONCALL_EXPIRED_LEAD));
       }
       return false;
     }
@@ -949,8 +975,9 @@ async function main() {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       client: client as any,
       opmAuto: {
-        // 사람 확인 없이 실행하는 것은 허용한 위험도이고 이 알림의 서버를 겨냥한 첫 조치안 하나뿐이다.
-        pick: (chips) => pickAutoOpm(chips, { project: alert.project, oid: alert.oid }, oncall.settings.risks),
+        // 사람 확인 없이 실행하는 것은 허용한 위험도이고 이 알림의 서버를 겨냥한 첫 조치안 하나뿐이다. 그 서버는 Webhook JSON 의
+        // `서버 oid` 칸으로만 정한다 — 템플릿 알림의 oid 는 이벤트 메시지(자유 글)에서 읽은 것이라 분석에만 쓰고 조치는 버튼으로 남긴다.
+        pick: (chips) => pickAutoOpm(chips, { project: alert.project, oid: alert.serverOid }, oncall.settings.risks),
         answered: async (pick) => {
           // 사람이 확인해야 하는 조치안(위험도·대상이 자동 범위 밖이거나 두 번째 것)이 버튼으로 남았으면 당번을 부른다.
           // 답은 자리표시 글을 고친 것이라 멘션해도 알림이 가지 않는다 — 새 글로 부른다.
@@ -960,18 +987,40 @@ async function main() {
             await client.chat.postMessage({ channel, thread_ts: root,
               text: `<@${owner}> 사람이 확인해야 하는 조치안이 ${waiting}개 있어요. 위 답의 [조치 실행] 버튼은 당번만 누를 수 있어요.` });
           }
-          const token = pick.auto?.payload["confirmToken"];
-          if (pick.auto && typeof token === "string" && oncall.incidents.tryApply(root, token)) {
-            await autoApply({ root, owner, client, chip: pick.auto, token });
+          const auto = pick.auto;
+          const token = auto?.payload["confirmToken"];
+          if (!auto || typeof token !== "string") return;
+          // 자동으로 실행하지 않기로 했으면 그 조치안을 당번만 누를 수 있는 버튼으로 남긴다(답의 버튼 줄에서는 이미 뺐다).
+          const leaveForOwner = async (reason: string, why: string) => {
+            oncallLine({ root, owner, step: "auto-apply", result: "skipped", reason });
+            const lead = `<@${owner}> ${why} 필요하면 아래 [조치 실행]을 직접 눌러 주세요 — 다른 사람은 누를 수 없어요.`;
+            await client.chat.postMessage({ channel, thread_ts: root, text: lead,
+              blocks: [{ type: "section", text: { type: "mrkdwn", text: lead } }, ...opmChipBlocks([auto], { teamId: team, userId: owner }, opmChips)] });
+          };
+          // 분석하는 사이 앱이 지워졌거나, 누가 껐거나, 다른 사람이 당번이 됐으면 앞 당번 권한으로 실행하지 않는다.
+          const off = oncallOff(owner);
+          if (off === "inactive") {
+            oncallLine({ root, owner, step: "auto-apply", result: "skipped", reason: off });
+            return;
           }
+          if (off) {
+            await leaveForOwner(off, "자동 대응이 꺼졌거나 당번이 바뀌어 이 조치안은 자동으로 실행하지 않았어요.");
+            return;
+          }
+          if (!oncall.incidents.tryApply(root, token)) {
+            // 분석하는 사이 해소·닫힘 알림이 왔다. (그 밖의 거절은 같은 확인 토큰을 이미 자동 실행한 경우다.)
+            if (oncall.incidents.resolved(root)) await leaveForOwner("resolved", "분석하는 사이 알림이 해소되거나 닫혀 이 조치안은 자동으로 실행하지 않았어요.");
+            return;
+          }
+          await autoApply({ root, owner, client, chip: auto, token });
         },
       },
     });
     if (answered || !isWorkspaceActive(team)) return true;
     // 분석을 끝내지 못했다(Argus 오류 등 — 오류 문장은 handle 이 남겼다). 당번을 부르고, 누구든 다시 분석할 [분석] 버튼을 붙인다.
     oncallLine({ root, owner, step: "answered", result: "failed" });
-    await client.chat.postMessage({ channel, thread_ts: root,
-      text: `<@${owner}> 자동 분석을 끝내지 못했어요. 아래 [분석] 버튼으로 다시 분석할 수 있어요.` });
+    await oncallTry("owner notice", root, () => client.chat.postMessage({ channel, thread_ts: root,
+      text: `<@${owner}> 자동 분석을 끝내지 못했어요. 아래 [분석] 버튼으로 다시 분석할 수 있어요.` }));
     return false;
   };
 
@@ -1000,11 +1049,11 @@ async function main() {
       ({ resp, body } = await callOpm(oncall.login, team, owner, "apply", token));
     } catch (err) {
       if (err instanceof LoginRequiredError) {
-        await callOwner("login-required", "와탭 로그인이 필요해 자동 조치를 실행하지 못했어요. 로그인 링크를 보냈어요 — 다시 연결한 뒤 아래 버튼으로 실행할 수 있어요.", true);
-        await sendWhatapLoginLink(oncall.login, {
+        await oncallTry("owner notice", root, () => callOwner("login-required", "와탭 로그인이 필요해 자동 조치를 실행하지 못했어요. 로그인 링크를 보냈어요 — 다시 연결한 뒤 아래 버튼으로 실행할 수 있어요.", true));
+        await oncallTry("login link", root, () => sendWhatapLoginLink(oncall.login, {
           teamId: team, userId: owner, isDm: false, channel, threadTs: root,
           say: (args) => client.chat.postMessage({ channel, text: args.text, thread_ts: args.thread_ts }), client,
-        }, ONCALL_EXPIRED_LEAD);
+        }, ONCALL_EXPIRED_LEAD));
         return;
       }
       console.warn(`[argus-slack-bot] oncall auto-apply failed root=${root}: ${String(err)}`);
@@ -1014,11 +1063,11 @@ async function main() {
     if (!resp.ok) {
       // front 가 쓰기 허락이 없는 토큰을 막았다(실행하지 않았다). 허락받을 링크는 당번에게만 보낸다.
       if (missingScope(resp.status, resp.headers.get("www-authenticate")) !== null) {
-        await callOwner("insufficient-scope", "와탭 쓰기 허락이 없어 자동 조치를 실행하지 못했어요. 허락할 링크를 보냈어요 — 허락한 뒤 아래 버튼으로 실행할 수 있어요.", true);
-        await sendWhatapLoginLink(oncall.login, {
+        await oncallTry("owner notice", root, () => callOwner("insufficient-scope", "와탭 쓰기 허락이 없어 자동 조치를 실행하지 못했어요. 허락할 링크를 보냈어요 — 허락한 뒤 아래 버튼으로 실행할 수 있어요.", true));
+        await oncallTry("consent link", root, () => sendWhatapLoginLink(oncall.login, {
           teamId: team, userId: owner, isDm: false, channel, threadTs: root,
           say: (args) => client.chat.postMessage({ channel, text: args.text, thread_ts: args.thread_ts }), client,
-        }, OPM_CONSENT_LEAD);
+        }, OPM_CONSENT_LEAD));
         return;
       }
       const view = describeOpmError("apply", resp.status, body, title);
@@ -1046,10 +1095,19 @@ async function main() {
     // 실행됐다. 정해 둔 시간 안에 해소(RECOVERED)되지 않으면 당번을 부른다(해소 글이 오면 resolve 가 멈춘다).
     const minutes = oncall.settings.escalateMin;
     oncall.incidents.applied(root, minutes * 60_000, async () => {
-      if (!isWorkspaceActive(team)) return;
-      oncallLine({ root, owner, step: "escalated", after: `${minutes}m` });
-      await post(escalationText(owner, minutes)).catch((err) =>
-        console.warn(`[argus-slack-bot] oncall escalation post failed root=${root}: ${String(err)}`));
+      // 타이머에서 돈다 — 여기서 던지면 받을 곳이 없어(unhandled rejection) 봇이 끝난다. 실패는 기록만 남긴다.
+      try {
+        // 그사이 자동 대응이 꺼졌거나 당번이 바뀌었으면(앱 삭제 포함) 부르지 않는다 — 멈춤 스위치는 걸려 있던 에스컬레이션도 멈춘다.
+        const off = oncallOff(owner);
+        if (off) {
+          oncallLine({ root, owner, step: "escalation", result: "skipped", reason: off });
+          return;
+        }
+        oncallLine({ root, owner, step: "escalated", after: `${minutes}m` });
+        await post(escalationText(owner, minutes));
+      } catch (err) {
+        console.warn(`[argus-slack-bot] oncall escalation failed root=${root}: ${String(err)}`);
+      }
     });
   };
 
@@ -1192,8 +1250,9 @@ async function main() {
     });
   });
 
-  // chip apply/cancel 클릭 핸들러. action_id 가 `apply_event_rule:<token>` 또는
-  // `cancel_event_rule:<token>` 형태라 정규식으로 매치.
+  // chip apply/cancel 클릭 핸들러. action_id 가 `apply_event_rule:<key>` 또는
+  // `cancel_event_rule:<key>` 형태라 정규식으로 매치. key 는 와탭 로그인 모드에서는 봇 메모리(ruleChips)의
+  // 손잡이이고, 레거시 모드에서는 확인 토큰 그 자체다.
   app.action(/^(apply|cancel)_event_rule:.+$/, async (ctx) => {
     const { ack, body, client, action } = ctx;
     await ack();
@@ -1213,19 +1272,21 @@ async function main() {
     const m = actionId.match(/^(apply|cancel)_event_rule:(.+)$/);
     if (!m) return;
     const op = m[1] as "apply" | "cancel";
-    const token = m[2];
+    const key = m[2];
+    // 와탭 로그인 모드에서는 아래에서 손잡이로 봇 메모리의 확인 토큰을 꺼낸다.
+    let token = key;
 
     // 누른 버튼 줄을 바로 "처리 중"으로 바꿔 두 번 누르지 않게 하고, 끝나면 결과 상태를 남긴다.
     // 원래 메시지 blocks 가 없으면(이벤트에 안 실려 온 경우) 건너뛴다. null 은 버튼 되돌리기.
     const message = (body as { message?: { ts?: string; text?: string; blocks?: unknown[] } }).message;
     const value = String((action as { value?: string }).value ?? "");
-    const chipLabel = value && value !== token ? value : "";
+    const chipLabel = value && value !== key ? value : "";
     let chipTouched = false;
     const setChipState = async (status: string | null) => {
       const original = message?.blocks;
       if (!message?.ts || !Array.isArray(original)) return;
       if (status === null && !chipTouched) return;
-      const blocks = status === null ? original : resolveChipBlocks(original, token, status);
+      const blocks = status === null ? original : resolveChipBlocks(original, key, status);
       if (!blocks) return;
       chipTouched = status !== null;
       try {
@@ -1269,6 +1330,22 @@ async function main() {
         (body as { team?: { id?: string } }).team?.id ||
         (body as { user?: { team_id?: string } }).user?.team_id || "";
       if (!/^T[A-Z0-9]+$/.test(teamId) || !userId || !isWorkspaceActive(teamId)) return;
+      const tellClicker = (text: string) => client.chat.postEphemeral({ channel, user: userId, text, thread_ts: threadTs });
+      const entry = ruleChips.get(key);
+      if (!entry) {
+        // 봇이 다시 시작됐거나 오래돼 손잡이를 잊었다. 확인 토큰을 action_id 에 싣던 예전 버튼도 여기로 온다 —
+        // 그 값을 토큰으로 쓰지 않는다. 눌러도 소용없는 버튼은 거두고, 누른 사람에게만 알린다.
+        await setChipState(":hourglass: 더 쓸 수 없는 버튼이에요");
+        await tellClicker(":hourglass: 이 알림 규칙 버튼은 더 쓸 수 없어요(봇이 다시 시작됐거나 시간이 많이 지났어요). 같은 내용을 다시 물어봐 주세요.");
+        return;
+      }
+      if (entry.teamId !== teamId || entry.userId !== userId) {
+        // argus 도 토큰을 받은 사람에 묶지만, 남의 확인 토큰을 내 와탭 토큰에 실어 보내는 일 자체를 하지 않는다.
+        // 버튼 줄도 건드리지 않는다 — 받은 사람이 누른 결과와 겹치지 않게.
+        await tellClicker(":lock: 다른 사람의 질문에서 나온 알림 규칙 변경이에요. 본인 질문의 버튼만 누를 수 있어요.");
+        return;
+      }
+      token = entry.token;
       loginCtx = {
         teamId,
         userId,
@@ -2174,8 +2251,9 @@ const EVENT_RULE_CHIP_TYPES = new Set(["applyEventRules", "cancelEventRules"]);
 // 레거시 모드에서 creds.argusCookie 없으면 호출자가 chip 을 붙이지 않는다 — argus 의
 // /v1/event-rules/{apply,cancel} 가 cookie 인증이라 token 만으론 401. chip 보여주고
 // 클릭 후 거부하는 것보다 표시 안 하는 게 UX 일관성 ↑ (renderCookieGateHint 참고).
-// 와탭 로그인 모드에선 argus 가 같은 경로에서 사용자 토큰을 받으므로 항상 붙인다.
-function chipActionsToBlocks(actions: ChipAction[] | undefined): unknown[] {
+// 와탭 로그인 모드에선 argus 가 같은 경로에서 사용자 토큰을 받으므로 항상 붙인다. 이때는 bind 를 받아
+// 확인 토큰을 봇 메모리(store)에 두고 action_id 에는 손잡이만 싣는다 — 버튼은 물어본 사람(owner)만 누를 수 있다.
+function chipActionsToBlocks(actions: ChipAction[] | undefined, bind?: { owner: OpmChipOwner; store: OpmChipStore }): unknown[] {
   if (!actions || actions.length === 0) return [];
 
   // apply / cancel 을 한 row 에 묶어 보기. 같은 confirmToken 끼리.
@@ -2212,6 +2290,7 @@ function chipActionsToBlocks(actions: ChipAction[] | undefined): unknown[] {
     // 버튼 위에 미리보기 — 답변 문장과 상관없이 무엇이 어떻게 바뀌는지 보여 준다.
     const preview = renderRulePreview(group.find((a) => a.type === "applyEventRules")?.payload);
     if (preview) blocks.push({ type: "section", text: { type: "mrkdwn", text: preview } });
+    const key = bind ? bind.store.put(token, bind.owner, String(group[0].payload?.["targetLabel"] ?? group[0].label)) : token;
     const elements = group.map((a) => {
       const isApply = a.type === "applyEventRules";
       return {
@@ -2220,11 +2299,11 @@ function chipActionsToBlocks(actions: ChipAction[] | undefined): unknown[] {
           type: "plain_text",
           text: a.label.length > 75 ? a.label.slice(0, 72) + "..." : a.label,
         },
-        // action_id 에 type prefix + token 박아서 핸들러가 분기.
-        action_id: `${isApply ? "apply" : "cancel"}_event_rule:${token}`,
+        // action_id 에 type prefix + key(손잡이 또는 레거시 모드의 토큰) 박아서 핸들러가 분기.
+        action_id: `${isApply ? "apply" : "cancel"}_event_rule:${key}`,
         style: isApply ? "primary" : undefined,
-        // value 는 결과 문장에 쓸 대상 이름. 토큰은 action_id 에 있다.
-        value: String(a.payload?.["targetLabel"] ?? "").slice(0, 150) || token,
+        // value 는 결과 문장에 쓸 대상 이름. 없으면 key — 와탭 로그인 모드에서는 토큰을 Slack 에 싣지 않는다.
+        value: String(a.payload?.["targetLabel"] ?? "").slice(0, 150) || key,
       };
     });
     blocks.push({ type: "actions", elements });

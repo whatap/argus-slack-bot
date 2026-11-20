@@ -28,12 +28,12 @@ async function runWithStream(events: Array<[string, unknown]>) {
 test("argus 의 선택지와 그 위치를 RunResult 로 넘긴다", async () => {
   const r = await runWithStream([
     ["content_block_start", { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "opt_1", name: "render_options", input: {} } }],
-    ["content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: '{"options":["K8s-GPU (3396)"]}' } }],
+    ["content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: '{"options":["sample (1234)"]}' } }],
     ["content_block_stop", { type: "content_block_stop", index: 0 }],
     ["content_block_delta", { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "위 버튼에서 선택해 주세요." } }],
     ["message_stop", { type: "message_stop", conversationId: "conv-1" }],
   ]);
-  assert.deepEqual(r.options, [{ label: "K8s-GPU (3396)", value: "K8s-GPU (3396)" }]);
+  assert.deepEqual(r.options, [{ label: "sample (1234)", value: "sample (1234)" }]);
   assert.equal(r.optionsBeforeText, true);
   assert.equal(r.argusConversationId, "conv-1");
 });

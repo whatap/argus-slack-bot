@@ -439,12 +439,36 @@ test("webhook opt-in leaves existing mention handling outside its channel untouc
   await g.mention({ ...event, channel: "C1" });
   assert.equal(g.publicPosts.length, 1, "original mention listener when feature is off");
 });
-for (const op of ["apply", "cancel"]) {
+// ── 알림 규칙 [적용]/[취소] ───────────────────────────────────────────────────
+// 확인 토큰은 그 변경을 실행할 권한이다. 와탭 로그인 모드에서는 OPM 조치안처럼 토큰을 봇 메모리에만 두고 버튼에는
+// 손잡이만 싣는다. 버튼은 물어본 사람만 누를 수 있다. 레거시(공용 자격증명) 모드는 예전처럼 action_id 에 토큰을 싣는다.
+const RULE_TOKEN = "ct_synthetic-rule-token";
+const ruleChips = (token = RULE_TOKEN) => [
+  { type: "applyEventRules", label: "적용", payload: { confirmToken: token, targetLabel: "CPU 80% 초과 알림",
+    preview: { action: "create", items: [{ pcode: 42, action: "create" }] } } },
+  { type: "cancelEventRules", label: "취소", payload: { confirmToken: token, targetLabel: "CPU 80% 초과 알림" } },
+];
+// 봇 코드는 vm 안에서 돌아 배열의 prototype 이 다르다 — 펼쳐서 이 쪽 배열로 비교한다.
+const ruleButtons = (blocks: any[]) => [...blocks].filter((b) => b.type === "actions").flatMap((b) => [...b.elements])
+  .filter((e: any) => /^(apply|cancel)_event_rule:/.test(String(e.action_id)));
+/** U1 이 물어 알림 규칙 미리보기 답을 받아 두고, 그 메시지와 버튼을 돌려준다. 이후 기록만 보도록 지금까지의 기록은 비운다. */
+async function ruleAnswered(f: Awaited<ReturnType<typeof fixture>>) {
+  f.answerWith(() => fixtureAnswer({ text: "CPU 80% 초과 알림 규칙을 만들 준비가 됐어요.", chipActions: ruleChips() }));
+  await f.message("CPU 80% 넘으면 알려 줘");
+  const final = f.updates.at(-1);
+  const [apply, cancel] = ruleButtons(final.blocks);
+  f.updates.length = 0; f.publicPosts.length = 0; f.privatePosts.length = 0; f.fetches.length = 0;
+  return { message: { ts: "9.9", text: final.text, blocks: final.blocks }, apply: apply.action_id as string, cancel: cancel.action_id as string,
+    value: apply.value as string };
+}
+
+for (const op of ["apply", "cancel"] as const) {
   test(`OAuth ${op} uses the clicking user's token, never common credentials`, { timeout: 5000 }, async (t) => {
     const f = await fixture(t);
     f.links.save({ teamId: "T1", slackUserId: "U1", subject: "wtid-1", accessToken: tokens.accessToken,
       refreshToken: tokens.refreshToken, expiresAt: Date.now() + 600_000, scope: "openid whatap:read whatap:write" });
-    await f.action(`${op}_event_rule:fresh-confirm-token`);
+    const chip = await ruleAnswered(f);
+    await f.action(chip[op], undefined, "T1", { message: chip.message, value: chip.value });
     assert.equal(f.counts().credsLookups, 0, "OAuth actions must not consult legacy credentials");
     assert.equal(f.fetches.length, 1);
     assert.equal(f.fetches[0].url, `https://issuer.invalid/argus/v1/event-rules/${op}`);
@@ -452,13 +476,16 @@ for (const op of ["apply", "cancel"]) {
     assert.equal(headers.Authorization, `Bearer ${tokens.accessToken}`);
     assert.equal(headers.Cookie, undefined, "OAuth actions must not send the common cookie");
     assert.equal(headers["X-Argus-Token"], undefined, "OAuth actions must not send the common argus token");
-    assert.equal(JSON.parse(String(f.fetches[0].init.body)).confirmToken, "fresh-confirm-token");
+    assert.equal(JSON.parse(String(f.fetches[0].init.body)).confirmToken, RULE_TOKEN);
     assert.equal(f.publicPosts.length, 1);
     assert.doesNotMatch(JSON.stringify(f.publicPosts), /synthetic-common|synthetic-access/);
   });
   test(`OAuth ${op} without a WhaTap link sends a private login link and calls nothing`, { timeout: 5000 }, async (t) => {
     const f = await fixture(t);
-    await f.action(`${op}_event_rule:fresh-confirm-token`);
+    linkU1(f);
+    const chip = await ruleAnswered(f);
+    f.links.delete("T1", "U1");
+    await f.action(chip[op], undefined, "T1", { message: chip.message, value: chip.value });
     assert.equal(f.counts().credsLookups, 0, "OAuth actions must not consult legacy credentials");
     assert.equal(f.fetches.length, 0);
     assert.equal(f.publicPosts.length, 0);
@@ -498,37 +525,41 @@ const linkU1 = (f: Awaited<ReturnType<typeof fixture>>) => f.links.save({ teamId
 test("OAuth apply swaps the clicked buttons for a status line and says what changed where", { timeout: 5000 }, async (t) => {
   const f = await fixture(t);
   linkU1(f);
-  f.replyWith(() => Response.json({ action: "create", succeeded: [{ pcode: 3396, eventId: "e1" }], failed: [], elapsedMs: 300 }));
-  await f.action("apply_event_rule:ct_live", undefined, "T1", { message: chipMessage(), value: "CPU 80% 초과 알림" });
+  const chip = await ruleAnswered(f);
+  f.replyWith(() => Response.json({ action: "create", succeeded: [{ pcode: 42, eventId: "e1" }], failed: [], elapsedMs: 300 }));
+  await f.action(chip.apply, undefined, "T1", { message: chip.message, value: chip.value });
   assert.equal(f.updates.length, 2, "처리 중 → 결과, 두 번 바꾼다");
   for (const u of f.updates) {
     assert.equal(u.ts, "9.9");
     assert.equal(u.channel, "C1");
-    assert.doesNotMatch(JSON.stringify(u.blocks), /apply_event_rule:ct_live/, "누른 버튼은 다시 누를 수 없게 사라진다");
+    assert.ok(!JSON.stringify(u.blocks).includes(chip.apply), "누른 버튼은 다시 누를 수 없게 사라진다");
     assert.match(JSON.stringify(u.blocks), /알림 규칙 생성/, "미리보기는 남는다");
   }
   assert.match(JSON.stringify(f.updates[0].blocks), /적용하는 중/);
   assert.match(JSON.stringify(f.updates[1].blocks), /적용함/);
   assert.equal(f.publicPosts.length, 1);
-  assert.match(f.publicPosts[0].text, /\*CPU 80% 초과 알림\* — pcode 3396에 생성했어요/);
+  assert.match(f.publicPosts[0].text, /\*CPU 80% 초과 알림\* — pcode 42에 생성했어요/);
 });
 
 test("OAuth apply puts the buttons back when it could not reach argus (login needed)", { timeout: 5000 }, async (t) => {
   const f = await fixture(t);
-  const msg = chipMessage();
-  await f.action("apply_event_rule:ct_live", undefined, "T1", { message: msg, value: "CPU 80% 초과 알림" });
+  linkU1(f);
+  const chip = await ruleAnswered(f);
+  f.links.delete("T1", "U1");
+  await f.action(chip.apply, undefined, "T1", { message: chip.message, value: chip.value });
   assert.equal(f.fetches.length, 0);
   assert.equal(f.privatePosts.length, 1, "로그인 링크만 나에게");
-  assert.deepEqual(f.updates.at(-1).blocks, msg.blocks, "로그인 뒤 다시 누를 수 있게 버튼을 되돌린다");
+  assert.deepEqual(f.updates.at(-1).blocks, chip.message.blocks, "로그인 뒤 다시 누를 수 있게 버튼을 되돌린다");
 });
 
 test("OAuth apply on an expired confirmation retires the buttons and says why", { timeout: 5000 }, async (t) => {
   const f = await fixture(t);
   linkU1(f);
+  const chip = await ruleAnswered(f);
   f.replyWith(() => Response.json({ code: "token_not_found", error: "confirmToken not found or expired" }, { status: 404 }));
-  await f.action("apply_event_rule:ct_live", undefined, "T1", { message: chipMessage(), value: "CPU 80% 초과 알림" });
+  await f.action(chip.apply, undefined, "T1", { message: chip.message, value: chip.value });
   assert.match(JSON.stringify(f.updates.at(-1).blocks), /만료됨/);
-  assert.doesNotMatch(JSON.stringify(f.updates.at(-1).blocks), /apply_event_rule:ct_live/);
+  assert.ok(!JSON.stringify(f.updates.at(-1).blocks).includes(chip.apply));
   assert.match(f.publicPosts[0].text, /시간이 지났어요/);
 });
 
@@ -538,20 +569,66 @@ test("OAuth apply without write consent puts the buttons back and asks for conse
   const f = await fixture(t);
   f.links.save({ teamId: "T1", slackUserId: "U1", subject: "wtid-1", accessToken: tokens.accessToken,
     refreshToken: tokens.refreshToken, expiresAt: Date.now() + 600_000, scope: "openid whatap:read" });
-  const msg = chipMessage();
+  const chip = await ruleAnswered(f);
   f.replyWith(() => new Response(JSON.stringify({ status: 403, error: "Forbidden" }), {
     status: 403,
     headers: { "Content-Type": "application/json", "WWW-Authenticate": 'Bearer error="insufficient_scope", scope="whatap:write"' },
   }));
-  await f.action("apply_event_rule:ct_live", undefined, "T1", { message: msg, value: "CPU 80% 초과 알림" });
+  await f.action(chip.apply, undefined, "T1", { message: chip.message, value: chip.value });
   assert.equal(f.fetches.length, 1, "토큰 갱신·재시도 없이 한 번만 부른다");
   assert.equal(f.fetches[0].url, "https://issuer.invalid/argus/v1/event-rules/apply", "Argus 는 front 를 거쳐서만 부른다");
-  assert.deepEqual(f.updates.at(-1).blocks, msg.blocks, "허락한 뒤 다시 누를 수 있게 버튼을 되돌린다");
+  assert.deepEqual(f.updates.at(-1).blocks, chip.message.blocks, "허락한 뒤 다시 누를 수 있게 버튼을 되돌린다");
   assert.equal(f.publicPosts.length, 0);
   assert.equal(f.privatePosts.length, 1);
   assert.match(f.privatePosts[0].text, /WhaTap 설정 변경/);
   assert.match(f.privatePosts[0].text, /와탭 로그인 열기/);
   assert.doesNotMatch(f.privatePosts[0].text, /synthetic-access/);
+});
+
+test("와탭 로그인 모드의 알림 규칙 버튼에는 확인 토큰을 싣지 않는다 — 봇이 손잡이로 기억하고, 누르면 그 토큰을 요청 본문으로만 보낸다", { timeout: 5000 }, async (t) => {
+  const f = await fixture(t); linkU1(f);
+  f.answerWith(() => fixtureAnswer({ text: "CPU 80% 초과 알림 규칙을 만들 준비가 됐어요.", chipActions: ruleChips() }));
+  await f.message("CPU 80% 넘으면 알려 줘");
+  const answer = f.updates.at(-1);
+  const [apply, cancel] = ruleButtons(answer.blocks);
+  assert.ok(apply && cancel, "[적용]/[취소] 버튼");
+  assert.equal(apply.value, "CPU 80% 초과 알림", "버튼 값은 결과 문장에 쓸 대상 이름");
+  assert.doesNotMatch(JSON.stringify([f.updates, f.publicPosts, f.privatePosts]), new RegExp(RULE_TOKEN), "확인 토큰은 Slack 에 남기지 않는다");
+  const message = { ts: "9.9", text: answer.text, blocks: answer.blocks };
+  f.updates.length = 0; f.publicPosts.length = 0;
+  await f.action(apply.action_id, undefined, "T1", { message, value: apply.value });
+  assert.equal(f.fetches.length, 1);
+  assert.equal(JSON.parse(String(f.fetches[0].init.body)).confirmToken, RULE_TOKEN, "토큰은 요청 본문으로만 보낸다");
+  assert.doesNotMatch(JSON.stringify([f.updates, f.publicPosts, f.privatePosts]), new RegExp(RULE_TOKEN));
+});
+
+test("다른 사람이 받은 알림 규칙 [적용]/[취소] 는 누를 수 없다 — 아무것도 부르지 않고, 버튼 줄도 바꾸지 않고, 누른 사람에게만 알린다", { timeout: 5000 }, async (t) => {
+  const f = await fixture(t); linkU1(f); linkU2(f);
+  const chip = await ruleAnswered(f);
+  for (const id of [chip.apply, chip.cancel]) await f.action(id, undefined, "T1", { message: chip.message, value: chip.value, user: "U2" });
+  assert.equal(f.fetches.length, 0, "남이 받은 확인 토큰을 내 와탭 토큰에 실어 보내지 않는다");
+  assert.equal(f.updates.length, 0, "버튼 줄은 그대로 둔다 — '적용하는 중…' 으로 바꾸지도, 되돌리지도 않는다(받은 사람의 결과와 겹치지 않게)");
+  assert.equal(f.publicPosts.length, 0);
+  assert.deepEqual(f.privatePosts.map((p) => p.user), ["U2", "U2"]);
+  assert.match(f.privatePosts[0].text, /본인/);
+  // 다른 워크스페이스의 같은 사용자 ID 도 그 사람이 아니다.
+  await f.action(chip.apply, undefined, "T2", { message: chip.message, value: chip.value });
+  assert.equal(f.fetches.length, 0);
+  // 받은 사람은 그대로 누를 수 있다.
+  await f.action(chip.apply, undefined, "T1", { message: chip.message, value: chip.value });
+  assert.equal(f.fetches.length, 1);
+  assert.equal((f.fetches[0].init.headers as Record<string, string>).Authorization, `Bearer ${tokens.accessToken}`);
+});
+
+test("와탭 로그인 모드에서 봇이 기억하지 않는 알림 규칙 버튼(봇 재시작·토큰을 action_id 에 싣던 예전 버튼)은 그 값을 확인 토큰으로 쓰지 않는다", { timeout: 5000 }, async (t) => {
+  const f = await fixture(t); linkU1(f);
+  await f.action("apply_event_rule:ct_live", undefined, "T1", { message: chipMessage(), value: "CPU 80% 초과 알림" });
+  assert.equal(f.fetches.length, 0);
+  assert.equal(f.publicPosts.length, 0);
+  assert.deepEqual(f.privatePosts.map((p) => p.user), ["U1"]);
+  assert.match(f.privatePosts[0].text, /더 쓸 수 없어요/);
+  assert.match(JSON.stringify(f.updates.at(-1)?.blocks), /더 쓸 수 없는 버튼/, "눌러도 소용없는 버튼은 거둔다");
+  assert.doesNotMatch(JSON.stringify(f.updates.at(-1)?.blocks), /apply_event_rule:ct_live/);
 });
 
 for (const pause of ["ack", "postMessage"] as const) {
@@ -778,14 +855,14 @@ const followupButtons = (blocks: any[] | undefined) => (blocks ?? []).find((b) =
 test("argus options that came before the answer text are drawn as buttons above it", { timeout: 5000 }, async (t) => {
   const f = await fixture(t); linkU1(f);
   f.answerWith(() => fixtureAnswer({ text: "위 버튼에서 프로젝트를 선택해 주세요.", optionsBeforeText: true,
-    options: [{ label: "K8s-GPU (3396)", value: "3396 프로젝트의 [AI] 임시 확인용 알림 삭제해줘" }, { label: "demo (5490)", value: "demo (5490)" }] }));
+    options: [{ label: "sample (1234)", value: "1234 프로젝트의 [AI] 임시 확인용 알림 삭제해줘" }, { label: "example (5678)", value: "example (5678)" }] }));
   await f.message("[AI] 임시 확인용 알림 삭제해줘");
   const blocks = f.updates.at(-1).blocks as any[];
   const buttons = optionButtons(blocks);
   assert.ok(buttons, "the options are rendered as buttons");
   assert.deepEqual(buttons.elements.map((e: any) => [e.type, e.text.text, e.value]), [
-    ["button", "K8s-GPU (3396)", "3396 프로젝트의 [AI] 임시 확인용 알림 삭제해줘"],
-    ["button", "demo (5490)", "demo (5490)"],
+    ["button", "sample (1234)", "1234 프로젝트의 [AI] 임시 확인용 알림 삭제해줘"],
+    ["button", "example (5678)", "example (5678)"],
   ]);
   const textAt = blocks.findIndex((b) => b.type === "section" && b.text.text.includes("위 버튼에서"));
   assert.ok(textAt > blocks.indexOf(buttons), "the buttons the text points at sit above it");
@@ -858,7 +935,7 @@ test("DM messages outside a thread continue one conversation and are answered in
 for (const kind of ["followup_question", "choose_option"] as const) {
   test(`a ${kind} button under a DM answer continues that conversation in the DM itself`, { timeout: 5000 }, async (t) => {
     const f = await fixture(t); linkU1(f);
-    f.answerWith(() => fixtureAnswer({ optionsBeforeText: true, options: [{ label: "K8s-GPU (3396)", value: "3396" }], recommendedQuestions: ["삭제 진행해줘"] }));
+    f.answerWith(() => fixtureAnswer({ optionsBeforeText: true, options: [{ label: "sample (1234)", value: "1234" }], recommendedQuestions: ["삭제 진행해줘"] }));
     await f.message("[AI] 임시 확인용 알림 삭제해줘", { ts: "100.1" });
     const answer = f.updates.at(-1);
     const row = kind === "choose_option" ? optionButtons(answer.blocks) : followupButtons(answer.blocks);
@@ -1116,9 +1193,11 @@ test("whoami 는 로그인 서버에 닿지 않으면 연결을 지우지 않고
 
 test("만료된 연결로 [적용]을 누르면 만료됐다고 알리고 링크를 준다", { timeout: 5000 }, async (t) => {
   const f = await fixture(t);
+  linkU1(f);
+  const chip = await ruleAnswered(f);
   saveLink(f, Date.now() - 1_000);
   f.oauthClient.refresh = expiredRefresh;
-  await f.action("apply_event_rule:fresh-confirm-token");
+  await f.action(chip.apply, undefined, "T1", { message: chip.message, value: chip.value });
   assert.equal(f.fetches.length, 0);
   assert.equal(f.publicPosts.length, 0);
   assert.equal(f.privatePosts.length, 1);
@@ -1377,12 +1456,12 @@ test("whoami 를 처리하는 사이 연결이 지워졌으면(logout 등) 만�
 
 // ── Webhook JSON 알림의 시간대 (ALERT_TIME_ZONE) ─────────────────────────────
 // Webhook JSON 본문은 시각을 epoch ms 로 준다. 운영자가 정한 시간대로만 보이고, 없으면 그런 알림은 읽지 않는다(예전과 같다).
-const webhookJson = (ts = rootTs(), over: { status?: string; title?: string; level?: string; oid?: string; message?: string } = {}) => ({
+const webhookJson = (ts = rootTs(), over: { status?: string; title?: string; level?: string; oid?: string; message?: string; off?: string; id?: string } = {}) => ({
   channel_type: "group", channel: "C1", subtype: "bot_message", bot_id: "BFIXTURE", ts,
   attachments: [{ pretext: `[${over.level ?? "Warning"}][Server][test-project][test-target][${over.title ?? "test-rule"}]`,
     text: ["프로젝트 이름 : test-project", "프로젝트 코드 : 42", "서버 이름 : test-target", `이벤트 메시지 : ${over.message ?? "cpu 0.8511"}`,
-      `이벤트 상태 : ${over.status ?? "on"}`, "이벤트 시각(ms) : 1795003326611", "해소 시각(ms) : ", `서버 oid : ${over.oid ?? "1234"}`,
-      "이벤트 ID : 0123456789abcdef0123456789abcdef"].join("\n") }],
+      `이벤트 상태 : ${over.status ?? "on"}`, "이벤트 시각(ms) : 1795003326611", `해소 시각(ms) : ${over.off ?? ""}`, `서버 oid : ${over.oid ?? "1234"}`,
+      `이벤트 ID : ${over.id ?? "0123456789abcdef0123456789abcdef"}`].join("\n") }],
 });
 test("Webhook JSON alerts are read in the configured ALERT_TIME_ZONE; without one they stay unread; a bad name stops startup", async (t) => {
   const f = await fixture(t, true, true, { env: { ...alertEnv, ALERT_TIME_ZONE: "Asia/Seoul" } });
@@ -1398,7 +1477,7 @@ test("Webhook JSON alerts are read in the configured ALERT_TIME_ZONE; without on
 // ── 자동 대응(온콜) ─────────────────────────────────────────────────────────
 // 알림 채널에서 누군가 '자동 대응 켜기'를 하면 그 사람이 당번이 된다. 새 알림이 오면 [분석] 버튼을 기다리지 않고 당번의
 // 와탭 권한으로 분석하고, 정해 둔 위험도 안의 OPM 조치안 하나를 실행한다. 기본은 꺼짐이고, 꺼져 있으면 지금과 똑같다.
-const oncallEnv = { ...alertEnv, ONCALL_AUTO: "1", ONCALL_AUTO_RULES: "test-rule" };
+const oncallEnv = { ...alertEnv, ONCALL_AUTO: "1", ONCALL_AUTO_RULES: "test-rule", ALERT_TIME_ZONE: "Asia/Seoul" };
 
 test("ONCALL_AUTO=1 인데 알림 채널이나 와탭 로그인 설정이 없거나 값이 틀리면 봇이 시작하지 않는다", async (t) => {
   await assert.rejects(fixture(t, true, true, { env: { ONCALL_AUTO: "1" } }), /SLACK_ALERT_CHANNEL_ID/);
@@ -1600,20 +1679,23 @@ test("로그인 서버에 닿지 않아 당번 토큰을 확인하지 못해도 
   assert.equal(f.privatePosts.length, 0);
 });
 
-/** 이벤트 메시지에 서버 oid 를 적은 알림(규칙의 메시지에 oid 변수를 넣은 경우). 대상은 프로젝트 42 의 oid 1234. */
+/** 서버 oid 를 칸(`서버 oid`)으로 싣는 Webhook JSON 알림. 대상은 프로젝트 42 의 oid 1234 이고, 자동 조치는 이 알림에만 한다. */
+const serverAlert = (ts = rootTs(), over: Parameters<typeof webhookJson>[1] = {}) => webhookJson(ts, over);
+/** 이벤트 메시지(자유 글)에 서버 oid 를 적은 템플릿 알림(규칙의 메시지에 oid 변수를 넣은 경우). 대상은 프로젝트 42 의 oid 1234. */
 const oidAlert = (ts = rootTs()) => {
   const m = alertMessage(ts);
   m.attachments[0].text = m.attachments[0].text.replace("이벤트 메시지 : sample", "이벤트 메시지 : disk 92% (oid 1234)");
   return m;
 };
-/** 그 서버를 겨냥한 OPM 조치안(기본 위험도 warning). */
-const serverChip = (payload: Record<string, unknown> = {}) => opmChip({ pcode: 42, ...payload });
+/** 그 서버를 겨냥한 OPM 조치안(기본 위험도 warning). OPM 에 보낼 인자도 같은 프로젝트·oid 다. */
+const serverChip = (payload: Record<string, unknown> = {}) =>
+  opmChip({ pcode: 42, arguments: { function: "disk_cleanup", pcode: 42, oid: 1234, params: { path: "/app/logs", days: "7" } }, ...payload });
 
 test("자동 대응 답에서 허용한 위험도이고 알림의 서버를 겨냥한 조치안은 당번 권한으로 바로 실행하고, 무엇을 실행했는지와 결과를 스레드에 남긴다", async (t) => {
   const f = await armed(t);
   f.answerWith(() => fixtureAnswer({ text: "디스크 사용률이 높아요.", chipActions: [serverChip()] }));
   f.replyWith(() => Response.json({ proposal: proposal("executed", { pcode: 42, result: "deleted 12 files" }), replayed: false }));
-  const start = oidAlert();
+  const start = serverAlert();
   await f.incoming(start);
   assert.equal(f.fetches.length, 1, "사람이 누르지 않아도 한 번 실행한다");
   assert.equal(f.fetches[0].url, "https://issuer.invalid/argus/v1/opm/actions/apply", "front 의 argus 경로로만");
@@ -1639,7 +1721,7 @@ test("위험도가 높은(critical) 조치안은 자동으로 실행하지 않�
   const f = await armed(t);
   linkU2(f);
   f.answerWith(() => fixtureAnswer({ text: "디스크 사용률이 높아요.", chipActions: [serverChip({ risk: "critical" })] }));
-  const start = oidAlert();
+  const start = serverAlert();
   await f.incoming(start);
   assert.equal(f.fetches.length, 0, "critical 은 사람 확인 없이 실행하지 않는다");
   const answer = f.updates.at(-1);
@@ -1666,7 +1748,7 @@ test("자동 조치 요청의 답을 받지 못하면(연결 끊김) 바로 당�
   linkU2(f);
   f.answerWith(() => fixtureAnswer({ text: "디스크 사용률이 높아요.", chipActions: [serverChip()] }));
   f.replyWith(() => { throw new TypeError("fetch failed"); });
-  const start = oidAlert();
+  const start = serverAlert();
   await f.incoming(start);
   assert.equal(f.fetches.length, 1);
   const [failed] = ownerCalls(f, /실행 결과를 받지 못했어요/);
@@ -1689,7 +1771,7 @@ test("자동 조치 직전에 당번의 와탭 로그인이 끊겼으면 실행�
   const f = await armed(t);
   // 분석하는 사이 당번이 와탭 연결을 끊었다.
   f.answerWith(() => { f.links.delete("T1", "U1"); return fixtureAnswer({ text: "디스크 사용률이 높아요.", chipActions: [serverChip()] }); });
-  const start = oidAlert();
+  const start = serverAlert();
   await f.incoming(start);
   assert.equal(f.fetches.length, 0, "토큰 없이 실행하지 않는다");
   const [failed] = ownerCalls(f, /로그인/);
@@ -1702,11 +1784,71 @@ test("자동 조치 직전에 당번의 와탭 로그인이 끊겼으면 실행�
   assert.ok(f.logs.some((l) => / owner=U1 step=auto-apply result=login-required/.test(l)));
 });
 
+// 로그인 링크는 본인에게만(ephemeral) 보내는데, 당번이 그 채널에 없으면 Slack 이 거절한다(user_not_in_channel). 이런 대체 경로의
+// Slack 실패는 기록만 남기고 다음 단계를 잇는다 — 약속한 [분석] 버튼을 붙이고, 당번을 부르기로 한 곳에서는 부른다.
+const slackRefuses = () => Object.assign(new Error("An API error occurred: user_not_in_channel"), { code: "slack_webapi_platform_error" });
+for (const [name, setup, called] of [
+  ["로그인 링크를 보내지 못해도", (f: Fixture) => {
+    f.links.delete("T1", "U1");
+    f.client.chat.postEphemeral = async () => { throw slackRefuses(); };
+  }, /와탭 로그인이 필요해/],
+  ["당번을 부르는 글을 올리지 못해도", (f: Fixture) => {
+    saveLink(f, Date.now() - 1_000);
+    f.oauthClient.refresh = async () => { throw new TypeError("fetch failed"); };
+    const post = f.client.chat.postMessage;
+    f.client.chat.postMessage = async (args: any) => { if (/^<@U1> /.test(String(args.text))) throw slackRefuses(); return post(args); };
+  }, undefined],
+  ["자동 분석이 실패한 뒤 당번을 부르지 못해도", (f: Fixture) => {
+    f.answerWith(() => { throw new Error("argus down"); });
+    const post = f.client.chat.postMessage;
+    f.client.chat.postMessage = async (args: any) => { if (/^<@U1> /.test(String(args.text))) throw slackRefuses(); return post(args); };
+  }, undefined],
+] as const) {
+  test(`자동 대응을 못 하게 됐을 때 ${name}(Slack 오류) 약속한 [분석] 버튼은 붙이고 실패를 기록한다`, async (t) => {
+    // 자동 분석 실패는 handle 이 오류 줄(console.error)로 남긴다.
+    const f = await armed(t, oncallEnv, { captureErrors: true });
+    setup(f);
+    const start = alertMessage();
+    await f.incoming(start);
+    if (called) assert.ok(ownerCalls(f, called).length, "당번을 부른다");
+    assert.equal(analyzeButtons(f).length, 1, "사람이 이어받을 [분석] 버튼");
+    assert.ok(f.warnings.some((w) => /oncall (login link|owner notice) failed root=\S+: Error: An API error occurred: user_not_in_channel/.test(w)), "실패를 기록한다");
+    // 그 사건은 사람이 이어받는다 — [분석] 을 누르면 누른 사람 권한으로 분석한다.
+    linkU2(f);
+    f.answerWith(() => fixtureAnswer());
+    await f.action("webhook_alert_analyze", undefined, "T1", { user: "U2", value: start.ts, message: { ts: "1.1", thread_ts: start.ts } });
+    assert.equal(f.alertCalls.at(-1)?.auth.accessToken, "synthetic-access-2");
+  });
+}
+
+for (const [name, reply, called] of [
+  ["로그인이 끊겨", () => Response.json({}), /와탭 로그인이 필요해 자동 조치를 실행하지 못했어요/],
+  ["쓰기 허락이 없어", () => new Response(JSON.stringify({ status: 403, error: "Forbidden" }), { status: 403,
+    headers: { "Content-Type": "application/json", "WWW-Authenticate": 'Bearer error="insufficient_scope", scope="whatap:write"' } }), /허락/],
+] as const) {
+  test(`자동 조치를 ${name} 실행하지 못했는데 링크를 보내지 못해도(Slack 오류) 당번을 부르고 실패를 기록한다`, async (t) => {
+    const f = await armed(t);
+    f.client.chat.postEphemeral = async () => { throw slackRefuses(); };
+    f.answerWith(() => {
+      if (name === "로그인이 끊겨") f.links.delete("T1", "U1");
+      return fixtureAnswer({ text: "디스크 사용률이 높아요.", chipActions: [serverChip()] });
+    });
+    f.replyWith(reply);
+    const start = serverAlert();
+    await f.incoming(start);
+    const [failed] = ownerCalls(f, called);
+    assert.ok(failed, "당번을 부른다");
+    assert.equal(failed.thread_ts, start.ts);
+    assert.ok(opmButtons(failed.blocks ?? []).length > 0, "다시 연결·허락한 뒤 누를 버튼");
+    assert.ok(f.warnings.some((w) => /oncall (login|consent) link failed root=\S+: Error: An API error occurred: user_not_in_channel/.test(w)), "실패를 기록한다");
+  });
+}
+
 test("자동 조치가 거절되면(2xx 가 아니면) 오류 문장과 함께 바로 당번을 부르고, 다시 눌러도 소용없는 거절에는 버튼을 두지 않는다", async (t) => {
   const f = await armed(t);
   f.answerWith(() => fixtureAnswer({ text: "디스크 사용률이 높아요.", chipActions: [serverChip()] }));
   f.replyWith(() => Response.json({ code: "token_not_found", error: "Not Found" }, { status: 404 }));
-  await f.incoming(oidAlert());
+  await f.incoming(serverAlert());
   assert.equal(f.fetches.length, 1);
   const [failed] = ownerCalls(f, /다시 물어봐/);
   assert.ok(failed, "describeOpmError 의 문장으로 당번을 부른다");
@@ -1721,7 +1863,7 @@ test("쓰기 허락이 없는 당번 토큰이면(403 insufficient_scope) 당번
   f.answerWith(() => fixtureAnswer({ text: "디스크 사용률이 높아요.", chipActions: [serverChip()] }));
   f.replyWith(() => new Response(JSON.stringify({ status: 403, error: "Forbidden" }), { status: 403,
     headers: { "Content-Type": "application/json", "WWW-Authenticate": 'Bearer error="insufficient_scope", scope="whatap:write"' } }));
-  const start = oidAlert();
+  const start = serverAlert();
   await f.incoming(start);
   const [failed] = ownerCalls(f, /허락/);
   assert.ok(failed, "당번을 바로 부른다");
@@ -1735,7 +1877,7 @@ test("쓰기 허락이 없는 당번 토큰이면(403 insufficient_scope) 당번
 async function autoApplied(f: Fixture) {
   f.answerWith(() => fixtureAnswer({ text: "디스크 사용률이 높아요.", chipActions: [serverChip()] }));
   f.replyWith(() => Response.json({ proposal: proposal("executed", { pcode: 42 }), replayed: false }));
-  const start = oidAlert();
+  const start = serverAlert();
   await f.incoming(start);
   assert.equal(f.fetches.length, 1);
   return start;
@@ -1756,15 +1898,26 @@ test("자동 조치 뒤 ONCALL_ESCALATE_MIN 분 안에 해소되지 않으면 �
   assert.ok(f.logs.some((l) => new RegExp(` root=${start.ts} owner=U1 step=escalated`).test(l)));
 });
 
+// 에스컬레이션은 타이머에서 돈다 — 거기서 던지면 받을 곳이 없어(unhandled rejection) Node 22 에서는 봇이 끝난다.
+test("에스컬레이션 시각에 저장소를 읽지 못해도(DB 오류) 봇은 멈추지 않고 실패를 기록한다", async (t) => {
+  const f = await armed(t, oncallEnv, { captureErrors: true });
+  await autoApplied(f);
+  f.installations.getBotIdentity = () => { throw new Error("SQLITE_BUSY: database is locked"); };
+  const before = f.publicPosts.length;
+  await f.oncallClock.advance(10 * 60_000);
+  assert.equal(f.publicPosts.length, before, "부르지 못했다");
+  assert.ok(f.warnings.some((w) => /oncall escalation failed root=\S+: Error: SQLITE_BUSY/.test(w)), "실패를 기록한다");
+});
+
 test("자동 조치한 사건이 그 전에 해소되면 에스컬레이션을 멈추고, 해소 글에 지금처럼 걸린 시간과 자동 조치 뒤 걸린 시간을 남긴다", async (t) => {
   const f = await armed(t);
   const start = await autoApplied(f);
   await f.oncallClock.advance(3 * 60_000);
   const before = f.publicPosts.length;
-  await f.incoming(alertMessage(laterTs(start.ts, 100), true));
+  await f.incoming(serverAlert(laterTs(start.ts, 100), { status: "off", off: "1795003656611", title: "RECOVERED: test-rule", level: "Info", message: "RECOVERED" }));
   const [resolved] = f.publicPosts.slice(before);
   assert.equal(resolved.thread_ts, start.ts);
-  assert.match(resolved.text, /^RECOVERED: 2025-01-31 09:05:30 \+0900 \(이벤트 시각\) · 시작 2025-01-31 09:00:00 \+0900 · 소요 330초/, "지금의 해소 문장 그대로");
+  assert.match(resolved.text, /^RECOVERED: 2026-11-18 21:07:36 \+0900 \(이벤트 시각\) · 시작 2026-11-18 21:02:06 \+0900 · 소요 330초/, "지금의 해소 문장 그대로");
   assert.match(resolved.text, /자동 조치 후 3분 만에 해소/);
   assert.equal(escalations(f).length, 0, "에스컬레이션 타이머를 거둔다");
   await f.oncallClock.advance(60 * 60_000);
@@ -1778,7 +1931,7 @@ test("자동 조치가 결재 대기로 끝나면 결과 문장으로 바로 당
   linkU2(f);
   f.answerWith(() => fixtureAnswer({ text: "디스크 사용률이 높아요.", chipActions: [serverChip()] }));
   f.replyWith(() => Response.json({ proposal: proposal("pending_approval", { pcode: 42, approvalId: 42 }), replayed: false }));
-  const start = oidAlert();
+  const start = serverAlert();
   await f.incoming(start);
   const [waiting] = ownerCalls(f, /결재가 필요해 OPM 결재함에 올렸어요 \(결재 #42\)/);
   assert.ok(waiting, "당번을 부른다");
@@ -1799,7 +1952,7 @@ test("자동 조치가 실패(failed)로 끝나면 결과 문장으로 바로 �
   const f = await armed(t);
   f.answerWith(() => fixtureAnswer({ text: "디스크 사용률이 높아요.", chipActions: [serverChip()] }));
   f.replyWith(() => Response.json({ proposal: proposal("failed", { pcode: 42, result: "permission denied" }), replayed: false }));
-  await f.incoming(oidAlert());
+  await f.incoming(serverAlert());
   const [failed] = ownerCalls(f, /실행하지 못했어요/);
   assert.ok(failed, "당번을 부른다");
   assert.match(failed.text, /permission denied/);
@@ -1809,8 +1962,8 @@ test("자동 조치가 실패(failed)로 끝나면 결과 문장으로 바로 �
 
 test("알림에 서버 oid 가 없거나 조치안의 oid 가 다르면 자동으로 실행하지 않고 당번만 누를 수 있는 버튼으로 남긴다", async (t) => {
   for (const [name, alert, chip] of [
-    ["알림에 oid 없음", alertMessage(), serverChip()],
-    ["다른 서버의 조치안", oidAlert(), serverChip({ oid: 999, oname: "other-was" })],
+    ["알림에 oid 없음", serverAlert(rootTs(), { oid: "" }), serverChip()],
+    ["다른 서버의 조치안", serverAlert(), serverChip({ oid: 999, oname: "other-was" })],
   ] as const) {
     const f = await armed(t);
     f.answerWith(() => fixtureAnswer({ text: "디스크 사용률이 높아요.", chipActions: [chip] }));
@@ -1822,19 +1975,52 @@ test("알림에 서버 oid 가 없거나 조치안의 oid 가 다르면 자동�
   }
 });
 
+// 자동 실행은 카탈로그 조치(operant_action)와 고정 스크립트(operant_execute)뿐이고, OPM 에 가는 인자도 알림의 서버만 가리켜야 한다.
+test("자동 대응에서도 Job·배포·범용 OPM API 조치안이나 인자가 다른 서버를 가리키는 조치안은 실행하지 않고 당번만 누를 수 있는 버튼으로 남긴다", async (t) => {
+  for (const [name, chip] of [
+    ["범용 OPM API", serverChip({ tool: "operant_api_request", risk: "normal", arguments: { pcode: 42, oid: 1234, method: "POST", path: "/api/agents/restart", body: {} } })],
+    ["Job 배포", serverChip({ tool: "operant_deploy_activate", risk: "normal", arguments: { jobId: "job-1", agents: [{ pcode: 42, oid: 1234 }, { pcode: 42, oid: 999 }] } })],
+    ["인자가 다른 서버", serverChip({ arguments: { function: "disk_cleanup", pcode: 42, oid: 999, params: { path: "/app/logs" } } })],
+  ] as const) {
+    const f = await armed(t);
+    f.answerWith(() => fixtureAnswer({ text: "디스크 사용률이 높아요.", chipActions: [chip] }));
+    f.replyWith(() => Response.json({ proposal: proposal("executed", { pcode: 42 }), replayed: false }));
+    await f.incoming(webhookJson());
+    assert.equal(f.counts().argusCalls, 1, name);
+    assert.equal(f.fetches.length, 0, `${name}: 사람 없이 실행하지 않는다`);
+    assert.ok(opmButtons(f.updates.at(-1).blocks ?? []).length > 0, `${name}: 버튼으로 남긴다`);
+    assert.equal(ownerCalls(f, /확인해야 하는 조치안이 1개/).length, 1, `${name}: 당번을 부른다`);
+  }
+});
+
+// 템플릿 알림의 oid 는 이벤트 메시지(규칙을 만든 사람이 쓴 자유 글)에서 읽은 값이다. 분석 글에는 싣지만 사람 없이 조치할 대상으로는
+// 믿지 않는다 — 자동 조치는 `서버 oid` 칸이 있는 Webhook JSON 알림에만 한다.
+test("템플릿 알림(이벤트 메시지에 적힌 oid)은 자동으로 분석만 하고, 조치안은 실행하지 않고 당번만 누를 수 있는 버튼으로 남긴다", async (t) => {
+  const f = await armed(t);
+  f.answerWith(() => fixtureAnswer({ text: "디스크 사용률이 높아요.", chipActions: [serverChip()] }));
+  f.replyWith(() => Response.json({ proposal: proposal("executed", { pcode: 42 }), replayed: false }));
+  const start = oidAlert();
+  await f.incoming(start);
+  assert.equal(f.counts().argusCalls, 1, "분석은 한다");
+  assert.match(f.directCalls[0].text, /test-target \(oid 1234\)/, "분석 글에는 그 oid 를 싣는다");
+  assert.equal(f.fetches.length, 0, "사람 없이 실행하지 않는다");
+  assert.ok(opmButtons(f.updates.at(-1).blocks ?? []).length > 0, "버튼으로 남긴다");
+  assert.equal(ownerCalls(f, /확인해야 하는 조치안이 1개/).length, 1, "당번을 부른다");
+  assert.ok(f.publicPosts.every((p) => p.thread_ts === start.ts));
+});
+
 test("한 사건에서 자동으로 실행하는 조치안은 하나뿐이고, 같은 확인 토큰은 다른 사건에서도 다시 자동 실행하지 않는다", async (t) => {
   const f = await armed(t);
   const second = serverChip({ confirmToken: "oa_synthetic-second", title: "캐시 비우기" });
   f.answerWith(() => fixtureAnswer({ text: "디스크 사용률이 높아요.", chipActions: [serverChip(), second] }));
   f.replyWith(() => Response.json({ proposal: proposal("executed", { pcode: 42 }), replayed: false }));
-  const start = oidAlert();
+  const start = serverAlert();
   await f.incoming(start);
   assert.deepEqual(f.fetches.map((x) => JSON.parse(String(x.init.body)).confirmToken), [OPM_TOKEN], "첫 조치안 하나만");
   assert.equal(opmButtons(f.updates.at(-1).blocks ?? []).filter((b: any) => b.action_id.startsWith("opm_action:apply:")).length, 1, "나머지는 버튼");
   assert.equal(ownerCalls(f, /확인해야 하는 조치안이 1개/).length, 1);
   // 다른 사건(다른 원본 글)의 답이 같은 확인 토큰을 다시 내놓아도 두 번 실행하지 않는다.
-  const other = oidAlert(laterTs(start.ts, 30));
-  other.attachments[0].text = other.attachments[0].text.replace("archiveId=17", "archiveId=18");
+  const other = serverAlert(laterTs(start.ts, 30), { id: "fedcba9876543210fedcba9876543210" });
   f.answerWith(() => fixtureAnswer({ text: "또 높아요.", chipActions: [serverChip()] }));
   await f.incoming(other);
   assert.equal(f.counts().argusCalls, 2, "다른 사건이라 분석은 한다");
@@ -1852,7 +2038,7 @@ test("같은 알림이 다시 오거나(Slack 재전송) 같은 사건의 시작
 });
 
 test("해소·닫힘(DISABLED) 알림은 분석하지 않고, 자동 조치한 사건이 닫히면 에스컬레이션만 멈춘다(해소 시간은 붙이지 않는다)", async (t) => {
-  const f = await armed(t, { ...oncallEnv, ALERT_TIME_ZONE: "Asia/Seoul" });
+  const f = await armed(t);
   f.answerWith(() => fixtureAnswer({ text: "CPU 가 높아요.", chipActions: [serverChip()] }));
   f.replyWith(() => Response.json({ proposal: proposal("executed", { pcode: 42 }), replayed: false }));
   const start = webhookJson();
@@ -1874,14 +2060,88 @@ test("해소·닫힘(DISABLED) 알림은 분석하지 않고, 자동 조치한 �
   assert.ok(!f.publicPosts.some((p) => /확인이 필요해요/.test(p.text)));
 });
 
+// 분석은 1분 넘게 걸릴 수 있다. 그사이 해소·닫힘 알림이 오면 그 뒤 답의 조치안은 자동으로 실행하지 않는다 — 실행하면 해소된 사건에
+// 조치가 나가고, 해소 기록이 이미 지나가 에스컬레이션이 거짓으로 울린다. 조치안은 당번만 누를 수 있는 버튼으로 남긴다.
+for (const [name, close] of [
+  ["해소(RECOVERED)", { status: "off", title: "RECOVERED: test-rule", level: "Info", message: "RECOVERED" }],
+  ["닫힘(DISABLED)", { status: "cancel", title: "DISABLED: test-rule", level: "Info", message: "DISABLED" }],
+] as const) {
+  test(`분석하는 사이 ${name} 알림이 오면 자동 조치를 실행하지 않고 에스컬레이션도 걸지 않는다`, async (t) => {
+    const f = await armed(t);
+    linkU2(f);
+    const start = webhookJson();
+    f.answerWith(async () => {
+      await f.incoming(webhookJson(laterTs(start.ts, 30), close));
+      return fixtureAnswer({ text: "CPU 가 높아요.", chipActions: [serverChip()] });
+    });
+    f.replyWith(() => Response.json({ proposal: proposal("executed", { pcode: 42 }), replayed: false }));
+    await f.incoming(start);
+    assert.equal(f.counts().argusCalls, 1, "분석은 했다");
+    assert.ok(f.publicPosts.some((p) => p.thread_ts === start.ts && /^(RECOVERED|DISABLED): /.test(String(p.text))), "해소·닫힘을 남겼다");
+    assert.equal(f.fetches.length, 0, "해소·닫힌 사건에는 자동 조치를 하지 않는다");
+    assert.equal(escalations(f).length, 0, "에스컬레이션을 걸지 않는다");
+    assert.ok(f.logs.some((l) => new RegExp(` root=${start.ts} owner=U1 step=auto-apply result=skipped reason=resolved`).test(l)));
+    const [left] = ownerCalls(f, /자동으로 실행하지 않았어요/);
+    assert.ok(left, "당번을 부르고 조치안은 버튼으로 남긴다");
+    assert.equal(left.thread_ts, start.ts);
+    const [apply] = opmButtons(left.blocks ?? []);
+    assert.ok(apply, "[조치 실행] 버튼");
+    const message = { ts: "9.9", thread_ts: start.ts, text: left.text, blocks: left.blocks };
+    await f.action(apply.action_id, undefined, "T1", { message, user: "U2" });
+    assert.equal(f.fetches.length, 0, "당번만 누를 수 있다");
+    await f.oncallClock.advance(60 * 60_000);
+    assert.ok(!f.publicPosts.some((p) => /확인이 필요해요/.test(String(p.text))), "거짓 에스컬레이션이 없다");
+  });
+}
+
 test("'자동 대응 끄기'(멈춤 스위치) 뒤의 새 알림은 자동 대응하지 않고 [분석] 버튼만 붙인다", async (t) => {
   const f = await armed(t);
   await say(f, "자동 대응 끄기", { user: "U2" });
   f.publicPosts.length = 0;
-  await f.incoming(oidAlert());
+  await f.incoming(serverAlert());
   assert.equal(analyzeButtons(f).length, 1);
   assert.equal(f.counts().argusCalls, 0);
   assert.equal(f.fetches.length, 0);
+});
+
+// 멈춤 스위치는 진행 중인 것도 멈춘다. 분석은 1분 넘게 걸릴 수 있다 — 그사이 꺼졌거나 당번이 바뀌었으면 앞 당번 권한으로 실행하지 않는다.
+for (const [name, during] of [
+  ["'자동 대응 끄기'", async (f: Fixture) => { await say(f, "자동 대응 끄기", { user: "U2" }); }],
+  ["다른 사람의 '자동 대응 켜기'(당번 교체)", async (f: Fixture) => { linkU2(f); await say(f, "자동 대응 켜기", { user: "U2" }); }],
+] as const) {
+  test(`분석하는 사이 ${name}가 오면 앞 당번 권한으로 자동 조치하지 않고, 조치안은 그 당번만 누를 수 있는 버튼으로 남긴다`, async (t) => {
+    const f = await armed(t);
+    f.answerWith(async () => {
+      await during(f);
+      return fixtureAnswer({ text: "디스크 사용률이 높아요.", chipActions: [serverChip()] });
+    });
+    f.replyWith(() => Response.json({ proposal: proposal("executed", { pcode: 42 }), replayed: false }));
+    const start = serverAlert();
+    await f.incoming(start);
+    assert.equal(f.counts().argusCalls, 1);
+    assert.equal(f.fetches.length, 0, "사람 없이 실행하지 않는다");
+    assert.equal(escalations(f).length, 0);
+    assert.ok(f.logs.some((l) => new RegExp(` root=${start.ts} owner=U1 step=auto-apply result=skipped reason=disarmed`).test(l)));
+    const [left] = ownerCalls(f, /자동으로 실행하지 않았어요/);
+    assert.ok(left, "조치안은 버튼으로 남긴다");
+    assert.equal(left.thread_ts, start.ts);
+    const [apply] = opmButtons(left.blocks ?? []);
+    await f.action(apply.action_id, undefined, "T1", { message: { ts: "9.9", thread_ts: start.ts, text: left.text, blocks: left.blocks } });
+    assert.equal(f.fetches.length, 1, "그 조치안을 받은 사람이 누르면 실행한다");
+    assert.equal((f.fetches[0].init.headers as Record<string, string>).Authorization, `Bearer ${tokens.accessToken}`);
+  });
+}
+
+test("자동 조치 뒤 '자동 대응 끄기'를 하면 걸려 있던 에스컬레이션도 부르지 않는다", async (t) => {
+  const f = await armed(t);
+  const start = await autoApplied(f);
+  assert.equal(escalations(f).length, 1);
+  await say(f, "자동 대응 끄기", { user: "U2" });
+  const before = f.publicPosts.length;
+  await f.oncallClock.advance(10 * 60_000);
+  assert.equal(f.publicPosts.length, before, "당번을 부르지 않는다");
+  assert.ok(f.logs.some((l) => new RegExp(` root=${start.ts} owner=U1 step=escalation result=skipped reason=disarmed`).test(l)));
+  assert.ok(!f.logs.some((l) => / step=escalated/.test(l)));
 });
 
 const keepAliveTimers = (f: Fixture) => f.oncallClock.pending().filter((p) => p.every);
@@ -1982,8 +2242,8 @@ test("자동 분석이 실패하면(Argus 오류) 당번을 부르고 사람이 
 
 test("자동 대응이 켜져 있어도 허용하지 않은 발신자나 다른 채널의 알림 모양 글로는 아무것도 하지 않는다", async (t) => {
   const f = await armed(t);
-  await f.incoming({ ...oidAlert(), bot_id: "BOTHER" });
-  await f.incoming({ ...oidAlert(laterTs(rootTs(), 1)), channel: "C2" });
+  await f.incoming({ ...serverAlert(), bot_id: "BOTHER" });
+  await f.incoming({ ...serverAlert(laterTs(rootTs(), 1)), channel: "C2" });
   assert.equal(f.counts().argusCalls, 0);
   assert.equal(f.publicPosts.length + f.privatePosts.length, 0);
   assert.equal(f.tokenRequests(), 1, "켜기 때 한 번뿐 — 당번 토큰을 꺼내지 않는다");

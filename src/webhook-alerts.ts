@@ -106,8 +106,11 @@ export function readAlert(attachments: unknown, zone?: string) {
   // for OPM; Argus still checks that oid against the server name before it offers an action.
   const oids = new Set([...message.matchAll(/(?:^|[\s(,])oid[\s:=]+(-?[1-9]\d{0,18})(?![\w.])/gi)].map(m => m[1]));
   const written = fields.get("서버 oid") ?? "";
-  const oid = status !== undefined ? (/^-?[1-9]\d{0,18}$/.test(written) ? written : undefined) : oids.size === 1 ? [...oids][0] : undefined;
-  return { project, target, rule, level: subject[1], message, oid, start, recovered, cancelled, end, startMs, endMs, archive, identity };
+  // serverOid: the oid of the structured Webhook JSON field only. The event message is free text written by whoever wrote
+  // the rule; its oid may go into the analysis request, but it never names the server for an unattended action.
+  const serverOid = status !== undefined && /^-?[1-9]\d{0,18}$/.test(written) ? written : undefined;
+  const oid = status !== undefined ? serverOid : oids.size === 1 ? [...oids][0] : undefined;
+  return { project, target, rule, level: subject[1], message, oid, serverOid, start, recovered, cancelled, end, startMs, endMs, archive, identity };
 }
 
 type Alert = NonNullable<ReturnType<typeof readAlert>>;
@@ -136,10 +139,11 @@ type Notice = { kind: "offer"; thread: Thread } | { kind: "resolved"; root: stri
 // One instance per configured source. Reserve synchronously before posting to Slack, even on a retry.
 export class AlertThreads {
   private readonly records = new Map<string, Thread>();
+  // Occurrences refused while the tracker was full, with the root that was refused. Bounded like the records.
+  private readonly refused = new Map<string, string>();
   private readonly ttl = 24 * 60 * 60 * 1000;
-  private holdNewUntil = 0;
   constructor(private readonly now = Date.now, private readonly limit = 2048) {}
-  clear() { this.records.clear(); this.holdNewUntil = 0; }
+  clear() { this.records.clear(); this.refused.clear(); }
   private fresh(ts: string) {
     const age = this.now() - Number(ts) * 1000;
     return age >= -60_000 && age < this.ttl;
@@ -151,15 +155,19 @@ export class AlertThreads {
   observe(alert: Alert, ts: string, bot: string): Notice | undefined {
     if (!this.fresh(ts)) return;
     for (const [key, e] of this.records) if (!this.fresh(e.root)) this.records.delete(key);
+    for (const [key, root] of this.refused) if (!this.fresh(root)) this.refused.delete(key);
     // Without a link the occurrence is its identity, which carries the event's own start time.
     const key = alert.archive ?? alert.identity;
     const old = this.records.get(key);
     // A recovery and a cancellation (rule edited or switched off) both close the occurrence.
     const closing = alert.recovered || alert.cancelled;
     if (!old) {
-      // An omitted first delivery may recur; don't admit it as a new root while still fresh.
-      if (this.records.size >= this.limit || this.now() < this.holdNewUntil) {
-        this.holdNewUntil = this.now() + this.ttl;
+      // An omitted first delivery may recur; don't admit it as a new root while still fresh. Only that occurrence
+      // waits: other new alerts are tracked again as soon as expired entries leave room.
+      if (this.refused.has(key)) return;
+      if (this.records.size >= this.limit) {
+        this.refused.set(key, ts);
+        if (this.refused.size > this.limit) this.refused.delete(this.refused.keys().next().value!);
         return;
       }
       const thread: Thread = { alert, root: ts, bot, state: closing ? "ignored" : "open" };

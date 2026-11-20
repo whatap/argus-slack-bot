@@ -240,13 +240,13 @@ const textDelta = (index: number, text: string): [string, unknown] =>
 
 test("render_options 의 선택지를 결과에 싣고, 글보다 먼저 왔음을 알린다", async () => {
   const r = await askWithStream([
-    ...optionsBlock(0, '{"options":["K8s-GPU (3396)","demo (5490)"]}'),
+    ...optionsBlock(0, '{"options":["sample (1234)","example (5678)"]}'),
     textDelta(1, "위 버튼에서 프로젝트를 선택해 주세요."),
     ["message_stop", { type: "message_stop", conversationId: "conv-1" }],
   ]);
   assert.deepEqual(r.options, [
-    { label: "K8s-GPU (3396)", value: "K8s-GPU (3396)" },
-    { label: "demo (5490)", value: "demo (5490)" },
+    { label: "sample (1234)", value: "sample (1234)" },
+    { label: "example (5678)", value: "example (5678)" },
   ]);
   assert.equal(r.optionsBeforeText, true);
   assert.equal(r.text, "위 버튼에서 프로젝트를 선택해 주세요.");
