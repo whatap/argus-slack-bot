@@ -11,24 +11,22 @@
 # rollback: 지금 판 직전에 돌던 판(history 기준)으로 바꾼다. 두 번 하면 원래 판으로 돌아온다.
 #   되돌린 판이 헬스체크를 못 넘으면 원래 판으로 돌려놓고 그 판의 헬스 결과(health=ok|fail)를 알린다.
 # 묶음의 코드(node)는 root 로 실행하지 않는다. 확인이 필요하면 서비스 계정으로 runuser 한다.
+# systemd unit·디렉터리·config.env 는 DevOps 가 서버 규칙대로(whatap 소유) 미리 둔다. 배포는 unit 을 설치·교체하지 않고
+# 소유·권한도 검사하지 않는다 (DEVOPS-6837). unit 이 없으면 S3 를 부르기 전에 멈춘다.
 # 결과 표식(워크플로가 읽는다): DEPLOY-OK · DEPLOY-FAILED · FIRST-DEPLOY-FAILED · ROLLBACK-OK · ROLLBACK-FAILED · STATUS-OK
-# 사유 표식: CONFIG-MISSING · SHA-MISMATCH · ARCH-MISMATCH · UNSAFE-DIR · UNSAFE-CONFIG · RESTART-FAILED
+# 사유 표식: CONFIG-MISSING · UNIT-MISSING · SHA-MISMATCH · ARCH-MISMATCH · RESTART-FAILED
 set -euo pipefail
 # SSM 의 umask 와 상관없이 서비스 계정(whatap)이 releases/ 를 읽을 수 있게 한다. 비밀 디렉터리는 따로 0700 으로 만든다.
 umask 022
 
-APP_ROOT=${APP_ROOT:-/data/whatap/argus-slack-bot}
-# 비밀이 아닌 운영 설정. unit 2개의 EnvironmentFile= 과 같은 곳이어야 한다 (root 소유 conf/, 배포가 바꾸지 않는다)
+APP_ROOT=${APP_ROOT:-/data/whatap/plugin/argus-slack-bot}
+# 비밀이 아닌 운영 설정. unit 2개의 EnvironmentFile= 과 같은 곳이어야 한다 (배포가 바꾸지 않는다)
 CONFIG_FILE=${CONFIG_FILE:-$APP_ROOT/conf/config.env}
-UNIT_DIR=${UNIT_DIR:-/etc/systemd/system}
 SERVICE_USER=${SERVICE_USER:-whatap}
 KEEP_RELEASES=${KEEP_RELEASES:-5}
 HEALTH_TRIES=${HEALTH_TRIES:-20}
 HEALTH_INTERVAL=${HEALTH_INTERVAL:-3}
-# APP_ROOT 와 그 위·아래 디렉터리, conf/·config.env 의 소유자 uid (시험에서만 바꾼다)
-TRUSTED_OWNER_UID=${TRUSTED_OWNER_UID:-0}
 SERVICE=argus-slack-bot.service
-TIMER=argus-slack-bot-backup.timer
 RELEASES="$APP_ROOT/releases"
 HISTORY="$APP_ROOT/history"
 SLACK_PORT=3000
@@ -103,23 +101,11 @@ restart() {
 # 이번 재시작 이후의 서비스 로그만 짧게 (GitHub Actions 로그에 실린다)
 journal_tail() { journalctl -u "$SERVICE" --since "@${RESTART_AT:-0}" -n 30 -o cat --no-pager 2>/dev/null || true; }
 
-# 있으면 TRUSTED_OWNER_UID 소유이고 group·other 쓰기 권한이 없어야 한다.
-# 심볼릭 링크는 링크 자체(리눅스는 늘 777)가 아니라 가리키는 곳을 본다 (/data/whatap 이 다른 디스크로 가는 링크일 수 있다).
-secure_path() {  # <실패 표식> <경로> <사유 표식>
-  local s
-  [ -e "$2" ] || return 0
-  s=$(stat -L -c '%u %a' "$2" 2>/dev/null || stat -L -f '%u %Lp' "$2") || s=""
-  [ "${s% *}" = "$TRUSTED_OWNER_UID" ] && [ $((8#${s#* } & 8#022)) = 0 ] || fail "$1" "$3 $2 ($s)"
-}
-
 preflight() {  # <실패 표식>
-  local d
   [ "$(id -u)" = 0 ] || fail "$1" "root 로 실행해야 해요"
   [ -f "$CONFIG_FILE" ] || fail "$1" "CONFIG-MISSING $CONFIG_FILE (deploy/config.env.example 참고)"
   id -u "$SERVICE_USER" >/dev/null 2>&1 || fail "$1" "USER-MISSING $SERVICE_USER"
-  # root 가 쓰고 실행하는 경로와 서비스 설정을 다른 계정(앱이 침해된 서비스 계정 포함)이 바꿀 수 없어야 한다
-  for d in "$(dirname "$APP_ROOT")" "$APP_ROOT" "$RELEASES" "$(dirname "$CONFIG_FILE")"; do secure_path "$1" "$d" UNSAFE-DIR; done
-  secure_path "$1" "$CONFIG_FILE" UNSAFE-CONFIG
+  systemctl cat "$SERVICE" >/dev/null 2>&1 || fail "$1" "UNIT-MISSING $SERVICE (서버에 미리 설치한다. deploy/systemd 참고)"
   SLACK_PORT=$(conf SLACK_HTTP_PORT 3000)
   OAUTH_PORT=$(conf WHATAP_OAUTH_PORT 3901)
 }
@@ -128,22 +114,6 @@ ensure_layout() {
   mkdir -p "$RELEASES" "$APP_ROOT/data" "$APP_ROOT/backups"
   chown "$SERVICE_USER:$SERVICE_USER" "$APP_ROOT/data" "$APP_ROOT/backups"
   chmod 0700 "$APP_ROOT/data" "$APP_ROOT/backups"
-}
-
-install_units() {  # <release 디렉터리> — 묶음의 systemd 파일이 다르면 바꾼다
-  local f name changed=0
-  for f in "$1"/deploy/systemd/*.service "$1"/deploy/systemd/*.timer; do
-    [ -f "$f" ] || continue
-    name=$(basename "$f")
-    if ! cmp -s "$f" "$UNIT_DIR/$name"; then
-      install -m 0644 "$f" "$UNIT_DIR/$name"
-      say "unit updated: $name"
-      changed=1
-    fi
-  done
-  if [ "$changed" = 1 ]; then systemctl daemon-reload; fi
-  systemctl enable "$SERVICE" >/dev/null
-  systemctl enable --now "$TIMER" >/dev/null
 }
 
 check_bundle() {  # <풀어 놓은 디렉터리>
@@ -227,7 +197,6 @@ cmd_deploy() {
 
   ensure_layout
   prev=$(current_release)
-  install_units "$dest"
   switch_to "$release"
   say "current: ${prev:-none} -> $release"
   restart
@@ -240,7 +209,6 @@ cmd_deploy() {
 
   journal_tail
   if [ -n "$prev" ] && [ -d "$RELEASES/$prev" ]; then
-    install_units "$RELEASES/$prev"
     switch_to "$prev"
     restart
     if wait_healthy; then
@@ -265,7 +233,6 @@ cmd_rollback() {
   [ -n "$cur" ] || fail ROLLBACK-FAILED "current 가 없어요"
   prev=$(previous_release "$cur")
   [ -n "$prev" ] || fail ROLLBACK-FAILED "되돌릴 직전 판이 없어요 (current=$cur)"
-  install_units "$RELEASES/$prev"
   switch_to "$prev"
   say "current: $cur -> $prev"
   restart
@@ -276,7 +243,6 @@ cmd_rollback() {
   fi
   journal_tail
   # 원래 판으로 돌려놓고 그 판이 다시 뜨는지 본다
-  install_units "$RELEASES/$cur"
   switch_to "$cur"
   restart
   wait_healthy || { h=fail; journal_tail; }
@@ -292,6 +258,7 @@ cmd_status() {
   echo "CONFIG=$([ -f "$CONFIG_FILE" ] && echo present || echo missing)"
   echo "SERVICE_USER=$(id -u "$SERVICE_USER" >/dev/null 2>&1 && echo present || echo missing)"
   echo "SERVICE=$(systemctl is-active "$SERVICE" 2>/dev/null || true)"
+  echo "UNIT=$(systemctl cat "$SERVICE" >/dev/null 2>&1 && echo present || echo missing)"
   echo "AWS_CLI=$(command -v aws || echo missing)"
   # APP_ROOT 의 상위 디렉터리가 없어도 나머지 상태는 보여 준다
   free=$(df -Pk "$(dirname "$APP_ROOT")" 2>/dev/null | awk 'NR==2{print $4}') || free=""
