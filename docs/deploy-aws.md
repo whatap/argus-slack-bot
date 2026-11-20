@@ -35,7 +35,7 @@ CI(`ci.yml`)는 PR 마다 두 아키텍처 묶음을 만들어 ubuntu 22.04 컨�
    - `/data` 영속 디스크: 묶음 5개(약 1GB) + SQLite 3개 + 서버 백업 7개
 2. 보안그룹
    - 인바운드 3000·3901: ALB 보안그룹만
-   - 아웃바운드 443: slack.com, service.whatap.io, Argus 주소(front 의 `argus_backend_url` 과 같은 곳)
+   - 아웃바운드 443: slack.com, service.whatap.io (Argus 는 front 의 `/argus` 를 거치므로 따로 열지 않는다)
 3. ALB (호스트 `argus-bot.whatap.io`, 리스너 443, TLS 1.2 이상, `*.whatap.io` 인증서)
    - 대상 그룹 3000: `/slack/*`, `/`, `/privacy`, `/terms`, `/support`. 헬스체크 `/` 200
    - 대상 그룹 3901: `/oauth/*`. 헬스체크 `/oauth/callback`, 성공 코드 400 (state 없는 요청은 400 이 정상)
@@ -138,5 +138,6 @@ CI 의 `smoke.sh` 가 앞의 네 항목을 묶음 단위로 확인한다. 로그
 ## 함께 필요한 것 (이 저장소 밖)
 
 - 운영 와탭 로그인 서버 활성화와 봇 클라이언트 등록 (콜백 `https://argus-bot.whatap.io/oauth/callback`)
-- Argus 운영에 사용자 Bearer 조회(whatap/argus#1052)와 설정 반영
+- front 운영 반영: 토큰을 확인한 뒤 그 계정의 짧은 세션으로 바꿔 Argus 에 넘기는 변경, 쓰기 경로의 `whatap:write` 확인, 봇 client 의 허용 경로(`oauth_surface.<client_id>`) 설정. Argus 는 토큰을 다루지 않으므로 인증 때문에 바꿀 것은 없다
+- OPM 조치 버튼과 자동 대응: argus#1066(`/v1/opm/actions/*`)이 들어간 Argus 와, 대상 서버를 관리하는 OPM
 - Slack 앱을 Socket Mode 에서 HTTP 로 전환: [http-rollout.md](http-rollout.md)
