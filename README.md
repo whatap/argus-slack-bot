@@ -4,7 +4,9 @@ Slack 워크스페이스에서 `@argus` 멘션으로 WhaTap 도메인 질의응�
 
 ## 와탭 OAuth 및 HTTP 전환
 
-사용자 로그인 모드: **Slack → 봇 → 사용자 Bearer로 Argus `/v1/agent` → WhaTap front의 사용자 권한 조회**.
+사용자 로그인 모드: **Slack → 봇 → 사용자 토큰으로 front `/argus/v1/chat`(front가 토큰과 scope를 확인하고 그 계정의 짧은 세션으로 바꿈) → Argus(세션만 받음) → front(사용자 권한)**. 봇은 Argus를 직접 부르지 않는다. Argus는 토큰을 다루지 않는다.
+
+- 알림 설정 변경은 미리보기의 [적용]으로만 일어나고, front가 `/argus/v1/event-rules/apply`에서 `whatap:write`를 확인한다. 허락이 없으면 나에게만 보이는 링크로 다시 허락받는다.
 
 - `login`으로 와탭 계정 연결, `whoami`로 계정 확인, `logout`으로 연결 해제.
 - 기본은 기존 Socket Mode. `SLACK_TRANSPORT=http`로 서명 검증 HTTP 수신을 선택할 수 있다.
@@ -117,6 +119,10 @@ DM 도 가능:
 - Slack thread 단위로 history 보관 (`ThreadHistory`, **SQLite 백킹** — 봇 재시작 후에도 thread 유지).
 - thread 안의 첫 호출에서 `ask_whatap_expert` 가 argus conversationId 발급 → `ThreadHistory.setArgusConvId` 로 저장 → 같은 thread 의 follow-up turn 의 `cfg.argusConversationId` 로 자동 주입 (argus 측 같은 conversation 으로 이어받음).
 - 30분 idle 시 자동 expire (메모리/디스크 누수 방지).
+- **DM 본문(스레드 밖)은 DM 하나가 한 대화다** (`dmMainThreadKey`). 봇이 "어느 프로젝트요?" 라고 되물으면 `3396` 처럼 짧게 답해도 앞 질문을 안다. 30분 쉬면 새 대화로 시작한다. 답변 아래 버튼(후속 질문·선택지)도 같은 대화로 이어지고 답은 DM 본문에 온다. 봇이 적용 결과를 그 답변의 스레드에 단 뒤에도 같다 — 답글이 달린 본문 메시지의 버튼 클릭에는 Slack 이 `thread_ts`(자기 `ts` 와 같은 값)를 실어 보내므로, 스레드 "안" 의 메시지(`thread_ts` ≠ `ts`)만 스레드 대화로 본다.
+- DM 본문 메시지 밑에 스레드를 열어 답하면(봇이 알림 적용 결과를 스레드에 단다) 그 스레드의 첫 메시지가 본문 대화를 이어받는다. 이미 자기 대화가 있는 스레드는 그대로 둔다.
+- argus 가 저장해 둔 대화를 더는 모르면(스트림의 `error` 이벤트, 종류 `NOT_FOUND` — 다른 와탭 계정으로 다시 로그인했거나 대화가 지워진 경우) 그 대화를 버리고 새 대화로 한 번 다시 묻는다. 답변 앞에 앞 내용이 빠졌다는 안내가 붙는다. argus 는 대화를 읽기 전에 거절하므로 다시 물어도 같은 일이 두 번 실행되지 않는다.
+- 같은 대화의 턴은 한 번에 하나씩 돈다 (`turn-queue.ts`). 답이 오기 전에 다음 메시지를 보내면 받았다는 표시만 먼저 뜨고, 앞 답이 끝난 뒤에 처리한다 — argus 가 같은 대화의 동시 턴을 막지 않기 때문이다. 앞 턴이 150초 넘게 끝나지 않으면 기다리지 않는다.
 
 ### 도구 호출 루프
 - Anthropic Messages API 의 manual tool_use loop. `claude-loop.ts` 참고.
@@ -147,6 +153,13 @@ argus 가 도구 응답에 `actions: [{type, label, payload}]` 박으면 봇이 
 
 ### 후속 질문 chip
 - argus 가 답변 시 `recommendedQuestions` 3개 발급 → 봇이 Block Kit button row 로 표시. 클릭 시 같은 thread 의 새 turn 으로 자동 전송 (`followup_question:<index>` action handler).
+
+### 선택지 버튼 (render_options)
+- argus 는 사용자가 골라야 할 때 `render_options` 도구로 선택지를 보내고 답변에는 "위 버튼에서 선택해 주세요" 라고만 쓴다. 선택지는 SSE 의 `tool_use` 블록(`name: render_options`)과 그 `input_json_delta` 로 온다 (`argus-direct.ts`).
+- 봇이 Block Kit button row 로 그린다 (`choose_option:<index>`). 누르면 그 값이 같은 대화의 다음 메시지로 간다.
+- 위치는 답변이 가리키는 쪽이다: 선택지가 글보다 먼저 왔으면 글 위, 아니면 글 아래.
+- 선택지가 있는 답변에는 고정 폴백 후속 질문을 붙이지 않는다 (argus 가 준 후속 질문은 붙인다).
+- Slack 한도(버튼 25개·글자 75자·값 2000자)를 넘는 선택지는 버튼에서 빠지고, 빠진 개수를 안내한다.
 
 ### 에러 친절화
 - argus / WhaTap / 네트워크 / Anthropic / MCP 8 가지 패턴 매칭 → 사용자에게 복구 액션 명시 (`humanize.ts`).

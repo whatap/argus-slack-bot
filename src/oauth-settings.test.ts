@@ -11,7 +11,7 @@ const FULL = {
   WHATAP_OAUTH_CLIENT_SECRET: "secret",
   WHATAP_OAUTH_REDIRECT_URI: "http://localhost:3901/oauth/callback",
   SLACK_TOKENS_ENCRYPTION_KEY: "k",
-  ARGUS_URL: "http://localhost:8091",
+  ARGUS_URL: "http://localhost:18080/argus",
 };
 
 test("와탭 로그인 설정이 하나도 없으면 기존 방식(null)", () => {
@@ -37,6 +37,20 @@ test("토큰 암호화 키와 ARGUS_URL 이 없으면 시작하지 않는다", (
   assert.throws(() => loadWhatapOAuthSettings({ ...FULL, ARGUS_URL: "" }), /ARGUS_URL/);
 });
 
+test("사용자 토큰은 front 로만 간다: ARGUS_URL 은 로그인 서버와 같은 곳의 /argus", () => {
+  for (const wrong of [
+    "http://localhost:8091", // Argus 직접 — front 의 scope 확인을 건너뛴다
+    "http://argus.example.internal/argus", // 다른 호스트
+    "https://localhost:18080/argus", // 다른 scheme
+    "http://localhost:18080", // 경로 없음
+    "http://localhost:18080/argus/", // 끝 슬래시 — `${ARGUS_URL}/v1/...` 가 // 가 된다
+    "http://localhost:18080/argus?x=1",
+  ]) {
+    assert.throws(() => loadWhatapOAuthSettings({ ...FULL, ARGUS_URL: wrong }), /http:\/\/localhost:18080\/argus/, wrong);
+  }
+  assert.ok(loadWhatapOAuthSettings(FULL));
+});
+
 test("콜백 경로는 /oauth/callback 이어야 한다", () => {
   assert.throws(
     () =>
@@ -56,7 +70,7 @@ test("기본값: scope, 콜백 주소의 포트, 127.0.0.1", () => {
     clientId: "argus-slack-bot-local",
     clientSecret: "secret",
     redirectUri: "http://localhost:3901/oauth/callback",
-    scope: "openid profile email whatap:read",
+    scope: "openid profile email whatap:read whatap:write",
   });
   assert.equal(s.listenPort, 3901);
   assert.equal(s.listenHost, "127.0.0.1");

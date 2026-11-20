@@ -28,7 +28,8 @@
 | `WHATAP_OAUTH_ISSUER`, `WHATAP_OAUTH_CLIENT_ID`, `WHATAP_OAUTH_CLIENT_SECRET` | 해당 환경의 와탭 인가 서버 클라이언트 |
 | `WHATAP_OAUTH_REDIRECT_URI=https://<같은 도메인>/oauth/callback` | 와탭 로그인 콜백. Slack 설치 콜백과 다름 |
 | `WHATAP_OAUTH_PORT=3901`, `WHATAP_OAUTH_LISTEN_HOST=127.0.0.1` | 와탭 콜백의 내부 리스너 |
-| `ARGUS_URL` | 사용자 Bearer를 받는 Argus 주소 |
+| `ARGUS_URL` | front 의 Argus 경로. 와탭 로그인 서버와 같은 origin 의 `/argus` 가 아니면 시작하지 않는다 (예: `https://service.whatap.io/argus`). 봇은 Argus 를 직접 부르지 않는다 |
+| `WHATAP_OAUTH_SCOPE` | 기본 `openid profile email whatap:read whatap:write`. 로그인 서버의 봇 클라이언트에도 같은 scope 가 등록돼 있어야 한다 |
 
 프로세스는 지속 실행형 Node 서비스와 영속 SQLite를 전제로 한다. 파일 기반 DB·메모리 pending state를 임시 서버리스 인스턴스나 여러 복제본에 그대로 올리지 않는다. 소스 디렉터리의 `.env`는 현재 loader가 환경변수보다 우선하므로, 운영 실행 디렉터리에는 개발 `.env`를 배치하지 않는다.
 

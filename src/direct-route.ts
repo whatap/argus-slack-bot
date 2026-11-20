@@ -127,5 +127,8 @@ export async function runDirectToArgus(
     ...(r.recommendedQuestions
       ? { recommendedQuestions: r.recommendedQuestions }
       : {}),
+    ...(r.options
+      ? { options: r.options, optionsBeforeText: r.optionsBeforeText === true }
+      : {}),
   };
 }

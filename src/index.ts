@@ -21,17 +21,61 @@ dotenvConfig({ override: true });
 import Anthropic from "@anthropic-ai/sdk";
 import http from "node:http";
 
-import { describeArgusSubTool, type ArgusDirectConfig } from "./argus-direct.js";
+import { ArgusStreamError, describeArgusSubTool, type ArgusDirectConfig } from "./argus-direct.js";
 import { runClaudeWithMcp, type ToolCallEntry } from "./claude-loop.js";
-import { ThreadHistory } from "./conversation.js";
+import { ThreadHistory, dmMainThreadKey, isDmMainThreadKey } from "./conversation.js";
 import { runDirectToArgus, type DirectRouteSnap } from "./direct-route.js";
 import { authorizationKind, createBotDmGuard, type ConversationsInfoClient } from "./dm-guard.js";
+import {
+  chipStatus,
+  describeApplyResult,
+  describeEventRuleOpError,
+  missingScope,
+  renderRulePreview,
+  resolveChipBlocks,
+  WRITE_CONSENT_LEAD,
+} from "./event-rule-chips.js";
+import { AlertThreads, alertSource, alertTimeZone, incidentPrompt, isAlertEnvelope, readAlert } from "./webhook-alerts.js";
 import { humanizeError } from "./humanize.js";
 import { inferCurrentUrl } from "./screen-infer.js";
 import { SqliteInstallationStore } from "./installations.js";
 import { landingPageHtml } from "./landing.js";
 import { privacyPageHtml, termsPageHtml, supportPageHtml } from "./legal.js";
 import { McpClientPool } from "./mcp-pool.js";
+import {
+  OncallIncidents,
+  OncallKeepAlive,
+  OncallOwners,
+  escalationText,
+  loadOncallSettings,
+  oncallLog,
+  oncallSettingsLines,
+  parseOncallCommand,
+  pickAutoOpm,
+  resolvedAfterApply,
+  ruleEligible,
+  systemTimers,
+  type OncallSettings,
+  type OpmPick,
+} from "./oncall-auto.js";
+import {
+  OPM_CHIP_TYPE,
+  OPM_CONSENT_LEAD,
+  OPM_NO_ANSWER,
+  OPM_PENDING,
+  OpmChipStore,
+  describeOpmError,
+  describeOpmOutcome,
+  opmChipBlocks,
+  opmStamp,
+  opmStatusRow,
+  opmText,
+  postOpmAction,
+  renderOpmProposal,
+  replaceOpmRow,
+  riskOf,
+  type OpmOp,
+} from "./opm-action-chips.js";
 import {
   PendingLogins,
   createOAuthHttpHandler,
@@ -42,6 +86,7 @@ import { createSlackApp, loadSlackSettings } from "./slack-app.js";
 import { createSlackFailureHandler } from "./slack-failure-log.js";
 import { createSlackLifecycleHandlers } from "./slack-lifecycle.js";
 import { ACCOUNT_SETUP_GUIDANCE, WHATAP_LOGIN_HELP } from "./onboarding.js";
+import { TurnQueue } from "./turn-queue.js";
 import { UserTokenStore, maskToken, type UserCreds } from "./user-tokens.js";
 import { WhatapLinkStore } from "./whatap-links.js";
 import {
@@ -72,6 +117,10 @@ const ANTHROPIC_MAX_TOKENS = Number(process.env.ANTHROPIC_MAX_TOKENS || 8192);
 // 비용 폭주 방지로 외곽은 3 으로 낮춤. env 로 override 가능.
 const MAX_TOOL_HOPS = Number(process.env.MAX_TOOL_HOPS || 3);
 const MAX_HISTORY_TURNS = Number(process.env.MAX_HISTORY_TURNS || 10);
+/** argus 가 앞 대화를 몰라서 새 대화로 답했을 때 답변 앞에 붙이는 안내. */
+const STARTED_OVER_NOTE = "_앞 대화를 이어갈 수 없어서 새 대화로 답했어요. 필요한 내용은 다시 알려 주세요._";
+/** 같은 대화의 앞 턴을 기다리는 상한. argus 요청 상한(argus-direct 의 120초)보다 조금 길게 잡는다. */
+const TURN_WAIT_MS = 150_000;
 
 // 토큰 DB 경로 — 기본 ./data/user_tokens.sqlite. WAL 모드.
 const USER_TOKENS_DB =
@@ -98,14 +147,20 @@ const ARGUS_API_TOKEN = process.env.ARGUS_API_TOKEN || "";
 
 // 와탭 로그인(OAuth) 모드. WHATAP_OAUTH_ISSUER·CLIENT_ID·CLIENT_SECRET·REDIRECT_URI 가
 // 모두 있으면 켠다. 사용자는 Slack 에서 login 으로 와탭 계정을 연결하고, 질문은 그 사용자
-// 토큰으로 argus /v1/agent 에 Bearer 로 간다 (cookie·X-Argus-Token·기본 토큰 폴백 없음).
+// 토큰으로 front 의 /argus/v1/chat 에 간다 (cookie·X-Argus-Token·기본 토큰 폴백 없음).
 // 일부만 있으면 조용히 기존 방식으로 떨어지지 않게 시작하지 않는다.
 let WHATAP_LOGIN: WhatapOAuthSettings | null = null;
+// Webhook JSON 알림의 epoch 시각을 보일 시간대(IANA 이름). 없으면 그런 알림은 읽지 않는다(지금과 같다).
+let ALERT_TIME_ZONE: string | undefined;
+// 자동 대응(온콜, ONCALL_AUTO=1). 꺼져 있으면(기본) null 이고 지금과 똑같이 동작한다(oncall-auto.ts).
+let ONCALL: OncallSettings | null = null;
 try {
   WHATAP_LOGIN = loadWhatapOAuthSettings(process.env);
   if (SLACK_SETTINGS.transport === "http" && IS_MULTI_WORKSPACE && !WHATAP_LOGIN) {
     throw new Error("공개 HTTP 다중 워크스페이스 모드에는 와탭 OAuth 설정이 필요해요");
   }
+  ALERT_TIME_ZONE = alertTimeZone(process.env);
+  ONCALL = loadOncallSettings(process.env, { whatapLogin: !!WHATAP_LOGIN, alertChannel: !!alertSource(process.env) });
 } catch (err) {
   console.error(`[argus-slack-bot] ${err instanceof Error ? err.message : String(err)}`);
   process.exit(1);
@@ -234,6 +289,8 @@ async function main() {
   const installationStore = IS_MULTI_WORKSPACE
     ? new SqliteInstallationStore(INSTALLATIONS_DB, TOKENS_ENCRYPTION_KEY || undefined)
     : null;
+  // OPM 조치안의 확인 토큰 — 버튼에는 손잡이만 싣고 토큰은 여기(메모리)에만 둔다.
+  const opmChips = new OpmChipStore();
   console.log(
     `[argus-slack-bot] token DB: ${USER_TOKENS_DB} encryption: ${
       tokenStore.isEncrypted() ? "enabled (AES-256-GCM)" : "DISABLED (plaintext)"
@@ -255,6 +312,7 @@ async function main() {
     THREAD_HISTORY_DB,
   );
   console.log(`[argus-slack-bot] thread history DB: ${THREAD_HISTORY_DB}`);
+  const turns = new TurnQueue(TURN_WAIT_MS);
 
   // MCP client 풀 — 사용자별 keep-warm child. 매 요청 spawn 오버헤드 (0.5-1s)
   // 제거. 사용자 creds 변경 시 envHash 로 자동 재spawn.
@@ -288,7 +346,7 @@ async function main() {
       oauthServer!.listen(listenPort, listenHost, () => resolve());
     });
     console.log(
-      `[argus-slack-bot] whatap login enabled: issuer=${WHATAP_LOGIN.oauth.issuer} client=${WHATAP_LOGIN.oauth.clientId} callback=${WHATAP_LOGIN.oauth.redirectUri} listen=${listenHost}:${listenPort} argus=${ARGUS_URL}/v1/agent`,
+      `[argus-slack-bot] whatap login enabled: issuer=${WHATAP_LOGIN.oauth.issuer} client=${WHATAP_LOGIN.oauth.clientId} callback=${WHATAP_LOGIN.oauth.redirectUri} listen=${listenHost}:${listenPort} argus=${ARGUS_URL}/v1/chat`,
     );
   }
 
@@ -312,6 +370,92 @@ async function main() {
   // 실패한 Slack 처리마다 시각·workspace·채널을 남긴다(본문·토큰 제외).
   app.error(createSlackFailureHandler((...args) => console.error(...args)));
   const isBotDm = createBotDmGuard();
+  const source = whatapLogin ? alertSource(process.env) : undefined;
+
+  const entries = new AlertThreads();
+  // 자동 대응(온콜). 꺼져 있으면(기본) 아무것도 만들지 않는다 — 지금과 똑같이 [분석] 버튼만 붙인다.
+  // 당번은 와탭 연결과 같은 DB 파일에 둔다(봇이 다시 시작해도 남는다). 사건 상태·타이머는 메모리에만 둔다.
+  const oncall = ONCALL && whatapLogin && source
+    ? { settings: ONCALL, login: whatapLogin, source, owners: new OncallOwners(USER_TOKENS_DB), incidents: new OncallIncidents(systemTimers) }
+    : undefined;
+  const oncallLine = (fields: { root?: string; owner: string; step: string; [key: string]: string | number | undefined }) =>
+    oncall && console.log(oncallLog({ ...fields, team: oncall.source.team, channel: oncall.source.channel }, systemTimers.now()));
+
+  /** 알림 채널에서 받은 자동 대응 명령. 켜기는 와탭 토큰이 살아 있는 사람만, 끄기는 누구나(멈춤 스위치)다. */
+  const runOncallCommand = async (command: "on" | "off" | "status", ctx: { userId: string; threadTs?: string; client: OncallSlack }) => {
+    if (!oncall) return;
+    const { team, channel } = oncall.source;
+    if (!/^U[A-Z0-9]+$/.test(ctx.userId) || !isWorkspaceActive(team)) return;
+    const post = (text: string) => ctx.client.chat.postMessage({ channel, thread_ts: ctx.threadTs, text });
+    const privateCtx: PrivateReplyContext = { teamId: team, userId: ctx.userId, isDm: false, channel, threadTs: ctx.threadTs, say: (args) => post(args.text), client: ctx.client };
+    if (command === "on") {
+      // 당번의 와탭 권한으로 분석·조치하므로, 지금 쓸 수 있는 토큰이 있어야 켠다.
+      try {
+        await oncall.login.manager.withAccessToken(team, ctx.userId, async () => undefined);
+      } catch (err) {
+        if (err instanceof LoginRequiredError) {
+          await sendWhatapLoginLink(oncall.login, privateCtx, ONCALL_LOGIN_LEAD);
+          return;
+        }
+        console.warn(`[argus-slack-bot] oncall arm token check failed user=${ctx.userId}: ${String(err)}`);
+        await replyPrivately(privateCtx, ":warning: 와탭 로그인 서버에 닿지 않아 자동 대응을 켜지 못했어요. 잠시 뒤 다시 보내 주세요.");
+        return;
+      }
+      oncall.owners.set(team, channel, ctx.userId);
+      oncallLine({ owner: ctx.userId, step: "armed" });
+      await post([`:robot_face: 자동 대응을 켰어요. 당번: <@${ctx.userId}>`, ...oncallSettingsLines(oncall.settings)].join("\n"));
+      return;
+    }
+    if (command === "off") {
+      // 멈춤 스위치 — 채널의 누구나 끌 수 있다. 다음 알림부터 다시 [분석] 버튼을 붙인다.
+      const owner = oncall.owners.get(team, channel);
+      if (!oncall.owners.clear(team, channel)) {
+        await post("자동 대응은 이미 꺼져 있어요. 새 알림에는 [분석] 버튼을 붙여요.");
+        return;
+      }
+      oncallLine({ owner: owner ?? "-", step: "disarmed", by: ctx.userId });
+      await post(`:octagonal_sign: <@${ctx.userId}> 님이 자동 대응을 껐어요. 새 알림에는 다시 [분석] 버튼을 붙여요.`);
+      return;
+    }
+    const owner = oncall.owners.get(team, channel);
+    await post(owner
+      ? [`:robot_face: 자동 대응이 켜져 있어요. 당번: <@${owner}>`, ...oncallSettingsLines(oncall.settings)].join("\n")
+      : "자동 대응은 꺼져 있어요. 새 알림에는 [분석] 버튼을 붙여요. 켜려면 `자동 대응 켜기` 를 보내 주세요(보낸 사람이 당번이 돼요).");
+  };
+
+  /** 이벤트 밖(타이머)에서 알림 채널에 글을 쓸 client — 그 워크스페이스의 봇 토큰(멀티는 설치 기록, 단일은 SLACK_BOT_TOKEN). */
+  const slackFor = async (teamId: string): Promise<OncallSlack> => {
+    const token = installationStore
+      ? (await installationStore.fetchInstallation({ teamId, enterpriseId: undefined, isEnterpriseInstall: false })).bot?.token
+      : SLACK_SETTINGS.botToken;
+    if (!token) throw new Error(`bot token missing team=${teamId}`);
+    return { chat: {
+      postMessage: (args) => app.client.chat.postMessage({ ...args, token } as never),
+      postEphemeral: (args) => app.client.chat.postEphemeral({ ...args, token } as never),
+    } };
+  };
+
+  // 당번 토큰 유지(keep-alive). 와탭 갱신 토큰은 8시간이면 끝나고 갱신할 때마다 새로 받는다 — 알림이 오래 없어도
+  // 끊기지 않게 정해 둔 주기마다 한 번씩 쓴다. 갱신이 거절되면(로그인 만료) 채널에 한 번만 알리고 당번은 그대로 둔다.
+  if (oncall) {
+    new OncallKeepAlive({
+      timers: systemTimers,
+      everyMs: oncall.settings.keepAliveMin * 60_000,
+      owners: () => oncall.owners.list().filter((o) =>
+        o.teamId === oncall.source.team && o.channelId === oncall.source.channel && isWorkspaceActive(o.teamId)),
+      refresh: (teamId, ownerId) => oncall.login.manager.withAccessToken(teamId, ownerId, async () => undefined),
+      notifyExpired: async (o) => {
+        const slack = await slackFor(o.teamId);
+        await slack.chat.postMessage({ channel: o.channelId,
+          text: `:lock: <@${o.ownerId}> 와탭 로그인이 만료돼 자동 대응을 멈췄어요. 다시 로그인하면 이어서 해요. 그동안 새 알림에는 [분석] 버튼을 붙여요.` });
+        await sendWhatapLoginLink(oncall.login, {
+          teamId: o.teamId, userId: o.ownerId, isDm: false, channel: o.channelId,
+          say: (args) => slack.chat.postMessage({ channel: o.channelId, text: args.text }), client: slack,
+        }, ONCALL_EXPIRED_LEAD);
+      },
+      log: (line) => console.log(line),
+    }).start();
+  }
 
   // 삭제 이벤트는 Bolt authorize 를 건너뛴다. 단일 workspace 의 신원은 미리 검증한다.
   if (!IS_MULTI_WORKSPACE) {
@@ -325,6 +469,9 @@ async function main() {
     singleWorkspace,
     onWorkspaceDeleted: (teamId) => {
       if (singleWorkspace?.teamId === teamId) singleWorkspace = undefined;
+      if (teamId === source?.team) entries.clear();
+      // 지운 워크스페이스의 당번은 남기지 않는다(다시 설치해도 예전 당번으로 자동 대응하지 않게).
+      if (oncall && oncall.owners.deleteTeam(teamId) > 0) oncallLine({ owner: "-", step: "disarmed", by: "uninstall" });
       threadHistory.deleteWorkspace(teamId);
     },
   });
@@ -365,6 +512,24 @@ async function main() {
     threadTs?: string;
     /** A followup captures this before ACK, not after its asynchronous notice. */
     history?: ReturnType<ThreadHistory["forWorkspace"]>;
+    /**
+     * 이 대화가 처음이면 이어받을 대화의 threadKey. DM 본문 메시지 밑에 스레드를 열어 답한 경우
+     * (봇이 적용 결과를 스레드에 단다) 본문에서 하던 대화를 잇는다.
+     */
+    inheritFrom?: string;
+    /**
+     * 질문이 가리키는 프로젝트를 봇이 이미 알 때(알림의 프로젝트 코드). 이 값이 있으면 글의 낱말로
+     * 화면·프로젝트를 추론하지 않는다 — 알림 규칙 이름이 다른 프로젝트의 화면 질문처럼 읽힐 수 있다.
+     */
+    pcode?: number;
+    /**
+     * 자동 대응(온콜)으로 연 분석일 때만. 답의 OPM 조치안 가운데 자동으로 실행할 하나를 버튼에서 빼고(pick),
+     * 답을 올린 뒤(대화 차례를 넘긴 다음) 그 조치를 실행한다(answered). 나머지는 지금처럼 버튼이다.
+     */
+    opmAuto?: {
+      pick: (chips: ChipAction[]) => OpmPick;
+      answered: (pick: OpmPick) => Promise<void>;
+    };
   }) => {
     const { text, userId, teamId, isDm, threadKey, say, client, threadTs } = params;
     if (!text) return;
@@ -386,6 +551,12 @@ async function main() {
     };
 
     // ── 명령 처리 (register/cookie/whoami/logout/help, 와탭 로그인 모드는 login 포함) ─
+    // 자동 대응 명령은 알림 채널의 멘션에서만 받는다(app_mention 이 먼저 가로챈다). 그 밖에서 온 것은 켜거나 끄지 않고
+    // Argus 에도 묻지 않는다 — 보낸 사람에게만 어디서 쓰는지 알린다.
+    if (oncall && parseOncallCommand(text)) {
+      await replyPrivately(privateCtx, ":information_source: 자동 대응 명령은 알림 채널에서 저를 멘션해 보내 주세요.");
+      return;
+    }
     const cmd = parseCommand(text, !!whatapLogin);
     if (cmd) {
       if (whatapLogin) {
@@ -413,7 +584,7 @@ async function main() {
       } catch (err) {
         if (!history.isActive()) return;
         if (err instanceof LoginRequiredError) {
-          await sendWhatapLoginLink(whatapLogin, privateCtx);
+          await sendWhatapLoginLink(whatapLogin, privateCtx, loginLinkLead(err));
           return;
         }
         console.error(`[argus-slack-bot] whatap token refresh failed user=${userId}:`, err);
@@ -495,31 +666,47 @@ async function main() {
     // ── direct route (정상 경로) vs legacy MCP+claude-loop (폴백) ─
     let result;
     let mcpClient: Awaited<ReturnType<typeof mcpPool.acquire>> | null = null;
-    const t0 = Date.now();
     // 와탭 로그인 모드에선 argus 대화가 사용자 소유라(다른 사용자의 conversationId 는
     // argus 가 NOT_FOUND 로 거절) 채널 thread 안에서도 사용자별로 이어 간다.
-    const convKey = whatapLogin ? `${threadKey}#${userId}` : threadKey;
-    if (!history.isActive()) return;
-    const state = history.get(convKey);
+    const convKeyOf = (key: string) => (whatapLogin ? `${key}#${userId}` : key);
+    const convKey = convKeyOf(threadKey);
+    // 같은 대화의 앞 턴이 끝난 뒤에 시작한다 — 앞 턴이 저장한 대화 ID 를 이어받고, argus 의 한 대화를
+    // 두 턴이 동시에 만지지 않게(turn-queue.ts). DM 스레드는 이어받을 본문 대화와 같은 줄에 선다.
+    const leaveTurn = await turns.enter(convKeyOf(params.inheritFrom ?? threadKey));
+    const t0 = Date.now();
+    // argus 가 모르는 대화라 새 대화로 다시 물었는지. 앞 내용이 빠진 답이라는 것을 답변에 알린다.
+    let startedOver = false;
+    // 자동 대응: 버튼에서 뺀 자동 실행 조치안과 나머지. 답을 다 올렸을 때만(answered) 그 조치를 실행한다.
+    let opmPick: OpmPick | undefined;
+    let answered = false;
 
     try {
+      if (!history.isActive()) return;
+      // state 를 읽어 온 키. DM 스레드가 본문 대화를 이어받았으면 본문 대화의 키다.
+      let stateKey = convKey;
+      let state = history.get(convKey);
+      if (params.inheritFrom && !state.argusConversationId && state.history.length === 0) {
+        stateKey = convKeyOf(params.inheritFrom);
+        state = history.get(stateKey);
+      }
       if (argusDirect) {
         // 정상 경로: 봇 외곽 LLM 우회. argus /v1/chat SSE 직접 소비.
         // 사용자 메시지에서 화면 의도 + pcode 추론 → 가짜 currentUrl 박음.
         // argus 의 screens.Lookup() 이 매칭 → cpm.yaml 의 domain_knowledge /
         // analysis_guides / data_registry inject. whatap-front 패널과 같은 효과.
-        // (와탭 로그인 모드의 /v1/agent 는 currentUrl 을 받지 않아 pcode 만 쓰인다.)
-        const inferred = inferCurrentUrl(text);
+        // (와탭 로그인 모드에서도 같은 본문이 front 의 /argus/v1/chat 으로 간다.)
+        const inferred = params.pcode === undefined ? inferCurrentUrl(text) : undefined;
         if (inferred) {
           console.log(
             `[argus-slack-bot] screen inferred: ${inferred.currentUrl}`,
           );
         }
+        let conversationId = state.argusConversationId;
         const askArgus = (cfg: ArgusDirectConfig) =>
           runDirectToArgus(
             {
               argusDirect: cfg,
-              argusConversationId: state.argusConversationId,
+              argusConversationId: conversationId,
               onProgress: (snap) => {
                 const now = Date.now();
                 if (now - lastUpdateAt < STREAM_INTERVAL_MS) return;
@@ -528,15 +715,31 @@ async function main() {
               },
             },
             text,
-            inferred?.pcode,
+            params.pcode ?? inferred?.pcode,
             inferred?.currentUrl,
           );
         // 와탭 로그인 모드: argus 가 401 이면 토큰을 한 번 갱신해 다시 묻는다.
-        result = whatapLogin
-          ? await whatapLogin.manager.withAccessToken(teamId, userId, (accessToken) =>
-              askArgus({ ...argusDirect, accessToken }),
-            )
-          : await askArgus(argusDirect);
+        const ask = () =>
+          whatapLogin
+            ? whatapLogin.manager.withAccessToken(teamId, userId, (accessToken) =>
+                askArgus({ ...argusDirect, accessToken }),
+              )
+            : askArgus(argusDirect);
+        try {
+          result = await ask();
+        } catch (err) {
+          // argus 가 이 대화를 모른다 — 다른 와탭 계정으로 다시 로그인했거나 대화가 지워졌다. DM 본문은 한
+          // 대화로 계속 이어지므로, 그대로 두면 매 메시지가 같은 오류로 끝난다. argus 는 대화를 읽기 전에
+          // 거절하므로 실행된 것이 없다 — 저장한 대화를 버리고 새 대화로 한 번만 다시 묻는다.
+          if (!conversationId || !(err instanceof ArgusStreamError) || err.code !== "NOT_FOUND") throw err;
+          console.warn(
+            `[argus-slack-bot] argus does not know the stored conversation, starting a new one user=${userId} thread=${threadKey}`,
+          );
+          history.reset(stateKey);
+          conversationId = undefined;
+          startedOver = true;
+          result = await ask();
+        }
       } else {
         // legacy fallback: argusDirect 미설정 (배포 환경에서만 발생).
         // MCP child 풀에서 acquire + 외곽 LLM tool_use loop.
@@ -587,10 +790,10 @@ async function main() {
       const isGreeting = isGreetingTrigger(text);
       const formattedText = stripArgusBranding(toSlackMrkdwn(result.text || "_(빈 응답)_"));
       const toolFooter = renderToolFooter(result.toolCallLog);
-      // 적용/취소 chip 은 argus cookie 인증이 필요해 와탭 로그인 모드에선 띄우지 않는다
-      // (cookie 등록 안내도 하지 않는다).
+      // 적용/취소 chip: 와탭 로그인 모드에선 그 사용자의 토큰으로 적용하므로 cookie 없이 띄운다.
+      // 레거시 모드는 argus cookie 가 있어야 띄운다(없으면 본문에 안내).
       const cookieHint = creds ? renderCookieGateHint(result.chipActions, creds) : "";
-      const formatted = [formattedText, cookieHint, toolFooter]
+      const formatted = [startedOver ? STARTED_OVER_NOTE : "", formattedText, cookieHint, toolFooter]
         .filter(Boolean)
         .join("\n\n");
       const chunks = splitForSlack(formatted);
@@ -598,20 +801,40 @@ async function main() {
       // chip actions (event-rule / flex-event 적용 / 취소) 가 있으면 마지막 chunk
       // 에 Block Kit button 으로 동봉. 클릭 시 app.action(action_id) 핸들러가
       // argus /v1/event-rules/apply 또는 /cancel 호출.
-      const chipBlocks = creds ? chipActionsToBlocks(result.chipActions, creds) : [];
-      // 추천 후속 질문 → Block Kit button. 클릭 시 같은 thread 의 새 turn.
+      // 자동 대응이면 자동으로 실행할 조치안 하나를 버튼에서 뺀다(나머지 버튼은 당번만 누를 수 있다).
+      opmPick = params.opmAuto?.pick(result.chipActions ?? []);
+      const chipBlocks = [
+        ...(whatapLogin || creds?.argusCookie ? chipActionsToBlocks(result.chipActions) : []),
+        // OPM 조치는 와탭 로그인 모드에서만 — 누른 사람의 토큰으로 front 를 거쳐 실행한다.
+        ...(whatapLogin ? opmChipBlocks(opmPick?.manual ?? result.chipActions ?? [], { teamId, userId }, opmChips) : []),
+      ];
+      // DM 본문 답변의 버튼 줄에는 표시를 남긴다 — 누르면 DM 본문 대화를 잇고 본문에 답하게.
+      const dmMain = isDmMainThreadKey(threadKey);
+      // argus 가 고르라고 준 선택지(render_options). 답변이 "버튼에서 고르세요" 라고 말하므로 버튼으로 그린다.
+      // 답변이 가리키는 쪽에 둔다: 글보다 먼저 왔으면("위 버튼에서…") 첫 조각의 글 위, 아니면 마지막 조각의 글 아래.
+      const optionBlocks = optionsToBlocks(result.options ?? [], dmMain);
+      // 추천 후속 질문 → Block Kit button. 클릭 시 같은 대화의 새 turn.
       // argus 가 발급 안 한 경우 항상 fallback (연우 피드백: 매 응답 chip 3개).
       // greeting 일 때는 더 풍부한 5개, 일반 turn 은 3개.
+      // 선택지가 있으면 고르는 게 다음 행동이라, argus 가 따로 준 후속 질문만 붙이고 고정 폴백은 붙이지 않는다.
       const argusFollowups = result.recommendedQuestions ?? [];
       const followupQueries =
         argusFollowups.length > 0
           ? argusFollowups
-          : isGreeting
-            ? STATIC_GREETING_CHIPS
-            : STATIC_FOLLOWUP_FALLBACK;
-      const followupBlocks = recommendedQuestionsToBlocks(followupQueries);
-      const extraBlocks = [...chipBlocks, ...followupBlocks];
+          : optionBlocks.length > 0
+            ? []
+            : isGreeting
+              ? STATIC_GREETING_CHIPS
+              : STATIC_FOLLOWUP_FALLBACK;
+      const followupBlocks = recommendedQuestionsToBlocks(followupQueries, dmMain);
+      const optionsOnTop = optionBlocks.length > 0 && result.optionsBeforeText === true;
       const lastIdx = chunks.length - 1;
+      const blocksFor = (i: number) =>
+        withTextSection(
+          chunks[i],
+          i === lastIdx ? [...(optionsOnTop ? [] : optionBlocks), ...chipBlocks, ...followupBlocks] : [],
+          i === 0 && optionsOnTop ? optionBlocks : [],
+        );
 
       if (placeholderTs) {
         try {
@@ -619,10 +842,7 @@ async function main() {
             channel: getChannelFromThreadKey(threadKey),
             ts: placeholderTs,
             text: chunks[0],
-            blocks:
-              lastIdx === 0
-                ? withTextSection(chunks[0], extraBlocks)
-                : undefined,
+            blocks: blocksFor(0),
           });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -632,23 +852,24 @@ async function main() {
           await say({
             text: chunks[0],
             thread_ts: threadTs,
-            blocks: lastIdx === 0 ? withTextSection(chunks[0], extraBlocks) : undefined,
+            blocks: blocksFor(0),
           });
         }
       } else {
         await say({
           text: chunks[0],
           thread_ts: threadTs,
-          blocks: lastIdx === 0 ? withTextSection(chunks[0], extraBlocks) : undefined,
+          blocks: blocksFor(0),
         });
       }
       for (let i = 1; i < chunks.length; i++) {
         await say({
           text: chunks[i],
           thread_ts: threadTs,
-          blocks: i === lastIdx ? withTextSection(chunks[i], extraBlocks) : undefined,
+          blocks: blocksFor(i),
         });
       }
+      answered = true;
     } catch (err) {
       if (!history.isActive()) return;
       console.error(
@@ -677,18 +898,175 @@ async function main() {
         await say({ text: errText, thread_ts: threadTs });
       }
     } finally {
+      leaveTurn();
       // legacy MCP fallback 경로만 release. direct route 는 mcpClient null.
       if (mcpClient) {
         mcpPool.release(userId);
       }
     }
+    // 자동 대응: 답을 다 올리고 대화 차례도 넘긴 뒤에 조치를 실행한다(실행은 1분 넘게 걸릴 수 있다).
+    if (answered && opmPick && params.opmAuto && history.isActive()) await params.opmAuto.answered(opmPick);
+    return answered;
+  };
+
+  /**
+   * 자동 대응 — 새 알림을 [분석] 버튼을 누른 것처럼 당번의 와탭 권한으로 분석한다(handle 의 같은 흐름).
+   * 분석을 시작했으면 true, 사람이 이어받아야 하면(버튼을 붙여야 하면) false.
+   */
+  const autoRespond = async (run: { alert: AlertRead; root: string; owner: string; client: OncallSlack }): Promise<boolean> => {
+    if (!oncall) return false;
+    const { team, channel } = oncall.source;
+    const { alert, root, owner, client } = run;
+    // 당번 토큰을 먼저 확인한다. 쓸 수 없으면 스레드에 당번을 불러 알리고, 사람이 이어받게 [분석] 버튼을 그대로 붙인다.
+    try {
+      await oncall.login.manager.withAccessToken(team, owner, async () => undefined);
+    } catch (err) {
+      const login = err instanceof LoginRequiredError;
+      oncallLine({ root, owner, step: "skipped", reason: login ? "login-required" : "token-error" });
+      await client.chat.postMessage({ channel, thread_ts: root, text: login
+        ? `<@${owner}> 와탭 로그인이 필요해 자동 대응을 하지 못했어요. 로그인 링크를 보냈어요. 아래 [분석] 버튼으로 누구든 이어서 분석할 수 있어요.`
+        : `<@${owner}> 와탭 로그인 서버에 닿지 않아 자동 대응을 하지 못했어요. 아래 [분석] 버튼으로 누구든 이어서 분석할 수 있어요.` });
+      if (login) {
+        await sendWhatapLoginLink(oncall.login, {
+          teamId: team, userId: owner, isDm: false, channel, threadTs: root,
+          say: (args) => client.chat.postMessage({ channel, text: args.text, thread_ts: args.thread_ts }), client,
+        }, ONCALL_EXPIRED_LEAD);
+      }
+      return false;
+    }
+    await client.chat.postMessage({ channel, thread_ts: root,
+      text: `이벤트 시작: ${alert.start} (이벤트 시각)\n:robot_face: 자동 대응을 시작해요. 당번 <@${owner}> 권한으로 분석해요.` });
+    oncallLine({ root, owner, step: "start" });
+    const answered = await handle({
+      text: incidentPrompt(alert),
+      pcode: Number(alert.project),
+      userId: owner,
+      teamId: team,
+      isDm: false,
+      threadKey: `${channel}:${root}`,
+      threadTs: root,
+      say: (args) => client.chat.postMessage({ channel, text: args.text, thread_ts: args.thread_ts, blocks: args.blocks }),
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      opmAuto: {
+        // 사람 확인 없이 실행하는 것은 허용한 위험도이고 이 알림의 서버를 겨냥한 첫 조치안 하나뿐이다.
+        pick: (chips) => pickAutoOpm(chips, { project: alert.project, oid: alert.oid }, oncall.settings.risks),
+        answered: async (pick) => {
+          // 사람이 확인해야 하는 조치안(위험도·대상이 자동 범위 밖이거나 두 번째 것)이 버튼으로 남았으면 당번을 부른다.
+          // 답은 자리표시 글을 고친 것이라 멘션해도 알림이 가지 않는다 — 새 글로 부른다.
+          const waiting = pick.manual.filter((c) => c.type === OPM_CHIP_TYPE && typeof c.payload["confirmToken"] === "string" && c.payload["confirmToken"]).length;
+          oncallLine({ root, owner, step: "answered", auto: pick.auto ? 1 : 0, manual: waiting });
+          if (waiting > 0) {
+            await client.chat.postMessage({ channel, thread_ts: root,
+              text: `<@${owner}> 사람이 확인해야 하는 조치안이 ${waiting}개 있어요. 위 답의 [조치 실행] 버튼은 당번만 누를 수 있어요.` });
+          }
+          const token = pick.auto?.payload["confirmToken"];
+          if (pick.auto && typeof token === "string" && oncall.incidents.tryApply(root, token)) {
+            await autoApply({ root, owner, client, chip: pick.auto, token });
+          }
+        },
+      },
+    });
+    if (answered || !isWorkspaceActive(team)) return true;
+    // 분석을 끝내지 못했다(Argus 오류 등 — 오류 문장은 handle 이 남겼다). 당번을 부르고, 누구든 다시 분석할 [분석] 버튼을 붙인다.
+    oncallLine({ root, owner, step: "answered", result: "failed" });
+    await client.chat.postMessage({ channel, thread_ts: root,
+      text: `<@${owner}> 자동 분석을 끝내지 못했어요. 아래 [분석] 버튼으로 다시 분석할 수 있어요.` });
+    return false;
+  };
+
+  /** 자동 대응의 조치 실행 — [조치 실행] 버튼과 같은 호출(callOpm)·같은 결과 문장을 당번 권한으로 쓴다. */
+  const autoApply = async (run: { root: string; owner: string; client: OncallSlack; chip: ChipAction; token: string }) => {
+    if (!oncall) return;
+    const { team, channel } = oncall.source;
+    const { root, owner, client, chip, token } = run;
+    const title = String(chip.payload["title"] ?? chip.label);
+    const post = (text: string, blocks?: unknown[]) => client.chat.postMessage({ channel, thread_ts: root, text, blocks });
+    const announce = `:robot_face: 자동 조치를 실행해요: ${opmText(title, 120)} (${opmText(chip.payload["oname"] ?? `pcode ${String(chip.payload["pcode"] ?? "")}`, 100)}, 위험도 ${riskOf(chip.payload)})`;
+    await post(announce, [
+      { type: "section", text: { type: "mrkdwn", text: announce } },
+      { type: "section", text: { type: "mrkdwn", text: renderOpmProposal(chip.payload) } },
+    ]);
+    // 실패하면 바로 당번을 부른다. 실행하지 않은 것이 확실하거나 답을 못 받은 경우는 당번만 누를 수 있는
+    // [조치 실행] 버튼을 같이 둔다 — argus 는 같은 조치안을 두 번 실행하지 않고 지금 상태를 돌려준다.
+    const callOwner = async (result: string, text: string, retry: boolean) => {
+      oncallLine({ root, owner, step: "auto-apply", result });
+      const lead = `<@${owner}> ${text}`;
+      await post(lead, retry ? [{ type: "section", text: { type: "mrkdwn", text: lead } }, ...opmChipBlocks([chip], { teamId: team, userId: owner }, opmChips)] : undefined);
+    };
+    let resp: Response;
+    let body: Record<string, unknown>;
+    try {
+      ({ resp, body } = await callOpm(oncall.login, team, owner, "apply", token));
+    } catch (err) {
+      if (err instanceof LoginRequiredError) {
+        await callOwner("login-required", "와탭 로그인이 필요해 자동 조치를 실행하지 못했어요. 로그인 링크를 보냈어요 — 다시 연결한 뒤 아래 버튼으로 실행할 수 있어요.", true);
+        await sendWhatapLoginLink(oncall.login, {
+          teamId: team, userId: owner, isDm: false, channel, threadTs: root,
+          say: (args) => client.chat.postMessage({ channel, text: args.text, thread_ts: args.thread_ts }), client,
+        }, ONCALL_EXPIRED_LEAD);
+        return;
+      }
+      console.warn(`[argus-slack-bot] oncall auto-apply failed root=${root}: ${String(err)}`);
+      await callOwner("no-answer", `자동 조치의 ${OPM_NO_ANSWER.replace(/^:warning: /, "")}`, true);
+      return;
+    }
+    if (!resp.ok) {
+      // front 가 쓰기 허락이 없는 토큰을 막았다(실행하지 않았다). 허락받을 링크는 당번에게만 보낸다.
+      if (missingScope(resp.status, resp.headers.get("www-authenticate")) !== null) {
+        await callOwner("insufficient-scope", "와탭 쓰기 허락이 없어 자동 조치를 실행하지 못했어요. 허락할 링크를 보냈어요 — 허락한 뒤 아래 버튼으로 실행할 수 있어요.", true);
+        await sendWhatapLoginLink(oncall.login, {
+          teamId: team, userId: owner, isDm: false, channel, threadTs: root,
+          say: (args) => client.chat.postMessage({ channel, text: args.text, thread_ts: args.thread_ts }), client,
+        }, OPM_CONSENT_LEAD);
+        return;
+      }
+      const view = describeOpmError("apply", resp.status, body, title);
+      oncallLine({ root, owner, step: "auto-apply", result: "rejected", http: resp.status, code: String(body["code"] ?? "") || undefined });
+      const lead = `<@${owner}> 자동 조치를 실행하지 못했어요.\n${view.text}`;
+      await post(lead, view.row === "restore"
+        ? [{ type: "section", text: { type: "mrkdwn", text: lead } }, ...opmChipBlocks([chip], { teamId: team, userId: owner }, opmChips)]
+        : undefined);
+      return;
+    }
+    const outcome = describeOpmOutcome("apply", body, title);
+    const status = String((body["proposal"] as { status?: unknown } | undefined)?.status ?? "");
+    if (status !== "executed") {
+      // 결재 대기·실패·확인 불가 등 — 끝나지 않았거나 실패했다. 바로 당번을 부른다. 결재 대기면 [상태 확인]을 둔다.
+      oncallLine({ root, owner, step: "auto-apply", result: status || "unknown" });
+      const lead = `<@${owner}> ${outcome.text}`;
+      await post(lead, outcome.check
+        ? [{ type: "section", text: { type: "mrkdwn", text: lead } },
+           ...opmStatusRow(opmChips.put(token, { teamId: team, userId: owner }, title), `${outcome.status} · 자동 조치`, true)]
+        : undefined);
+      return;
+    }
+    await post(outcome.text);
+    oncallLine({ root, owner, step: "auto-apply", result: "ok", status });
+    // 실행됐다. 정해 둔 시간 안에 해소(RECOVERED)되지 않으면 당번을 부른다(해소 글이 오면 resolve 가 멈춘다).
+    const minutes = oncall.settings.escalateMin;
+    oncall.incidents.applied(root, minutes * 60_000, async () => {
+      if (!isWorkspaceActive(team)) return;
+      oncallLine({ root, owner, step: "escalated", after: `${minutes}m` });
+      await post(escalationText(owner, minutes)).catch((err) =>
+        console.warn(`[argus-slack-bot] oncall escalation post failed root=${root}: ${String(err)}`));
+    });
   };
 
   app.event("app_mention", async ({ event, say, client, body }) => {
+    if (source && body.team_id === source.team && event.channel === source.channel &&
+        ("bot_id" in event || ("subtype" in event && event.subtype === "bot_message"))) return;
     const channel = event.channel;
     const threadTs = event.thread_ts ?? event.ts;
     const threadKey = `${channel}:${threadTs}`;
     const cleanText = event.text.replace(/<@[A-Z0-9]+>/g, "").trim();
+    // 자동 대응 명령은 알림 채널에서만 받는다. Argus 에 묻지 않는다.
+    const oncallCommand = oncall ? parseOncallCommand(cleanText) : undefined;
+    if (oncall && oncallCommand && body.team_id === oncall.source.team && channel === oncall.source.channel) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await runOncallCommand(oncallCommand, { userId: event.user ?? "", threadTs: event.thread_ts, client: client as any });
+      return;
+    }
     await handle({
       text: cleanText,
       userId: event.user ?? "",
@@ -703,20 +1081,46 @@ async function main() {
     });
   });
 
-  app.message(async ({ message, say, client, body }) => {
+  app.message(async ({ message, say, client, body, context }) => {
     const m = message as unknown as Record<string, unknown>;
-    if (m.channel_type !== "im") return;
+    if (m.channel_type !== "im") {
+      if (!source || !isAlertEnvelope(source, m, body, context.botId) || !isWorkspaceActive(source.team)) return;
+      const alert = readAlert(m.attachments, ALERT_TIME_ZONE);
+      if (!alert || typeof m.ts !== "string") return;
+      const notice = entries.observe(alert, m.ts, m.bot_id as string);
+      if (!notice) return;
+      if (notice.kind === "resolved") {
+        // 자동 대응한 사건이면 에스컬레이션을 멈춘다. 회복이면 자동 조치 뒤 걸린 시간을 붙인다(닫힘(DISABLED)은 해소가 아니다).
+        const auto = oncall?.incidents.resolve(notice.root);
+        const after = auto?.appliedAgoMs !== undefined && !alert.cancelled ? resolvedAfterApply(auto.appliedAgoMs) : "";
+        if (auto) oncallLine({ root: notice.root, owner: auto.owner, step: alert.cancelled ? "closed" : "resolved", afterApplyMs: auto.appliedAgoMs });
+        await client.chat.postMessage({ channel: source.channel, thread_ts: notice.root, text: notice.text + after });
+        return;
+      }
+      // 자동 대응: 당번이 있고 대상 규칙이면 [분석] 버튼을 기다리지 않고 당번 권한으로 바로 분석한다. 원본 글마다 한 번이다.
+      const owner = oncall && ruleEligible(oncall.settings.rules, alert.rule) ? oncall.owners.get(source.team, source.channel) : null;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      if (oncall && owner && oncall.incidents.claim(m.ts, owner) && await autoRespond({ alert, root: m.ts, owner, client: client as any })) return;
+      const text = `이벤트 시작: ${alert.start} (이벤트 시각)`;
+      const posted = await client.chat.postMessage({ channel: source.channel, thread_ts: m.ts, text, blocks: [
+        { type: "section", text: { type: "plain_text", text } },
+        { type: "actions", elements: [{ type: "button", action_id: "webhook_alert_analyze", text: { type: "plain_text", text: "분석" }, value: m.ts }] },
+      ] });
+      notice.thread.buttonTs = posted.ts;
+      return;
+    }
     if (m.subtype) return;
     const text = String(m.text ?? "").trim();
     if (!text) return;
     const channel = String(m.channel ?? "");
-    const ts = String(m.ts ?? "");
     // DM 에서 사용자가 명시적으로 thread 안에 있을 때만 thread reply. 새 DM
     // 메시지 (m.thread_ts 없음) 는 threadTs=undefined 로 두어 main 흐름에 답함.
     // 이전엔 자기 ts 를 parent 로 강제 thread 화 → 사용자가 채팅 탭 main 에서
     // 봇 응답을 thread 댓글로만 보던 회귀.
     const replyThreadTs = m.thread_ts ? String(m.thread_ts) : undefined;
-    const threadKey = `${channel}:${replyThreadTs ?? ts}`;
+    // 스레드 밖 DM 메시지는 메시지마다가 아니라 DM 하나로 대화를 잇는다 — 봇의 되물음에 "3396" 처럼
+    // 짧게 답해도 앞 질문을 안다. 30분 쉬면 새 대화다(ThreadHistory idle 만료).
+    const threadKey = replyThreadTs ? `${channel}:${replyThreadTs}` : dmMainThreadKey(channel);
     const teamId = (body as { team_id?: string }).team_id ?? "";
     // 삭제 세대는 첫 await(봇 DM 확인) 전에 고정한다. 그 사이 삭제·재설치돼도 이 메시지는 버린다.
     const history = /^T[A-Z0-9]+$/.test(teamId) ? threadHistory.forWorkspace(teamId) : undefined;
@@ -745,8 +1149,44 @@ async function main() {
       isDm: true,
       threadKey,
       threadTs: replyThreadTs,
+      inheritFrom: replyThreadTs ? dmMainThreadKey(channel) : undefined,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       say: (args) => say(args as any),
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+    });
+  });
+
+  // Only the admitted root and this bot's actual button reply identify the alert. Ignore client-supplied prose.
+  app.action(/^webhook_alert_analyze$/, async ({ ack, body, client, action }) => {
+    const b = body as { team?: { id?: string }; user: { id: string; team_id?: string }; channel?: { id?: string }; message?: { ts?: string; thread_ts?: string } };
+    const team = b.team?.id, channel = b.channel?.id, userId = b.user.id, root = b.message?.thread_ts;
+    const entry = root ? entries.get(root) : undefined;
+    await ack();
+    if (!whatapLogin || !source || team !== source.team || channel !== source.channel ||
+        !/^U[A-Z0-9]+$/.test(userId) || (b.user.team_id && b.user.team_id !== team) ||
+        !root || !entry || !entry.buttonTs || b.message?.ts !== entry.buttonTs ||
+        (action as { value?: string }).value !== root) return;
+    if (entries.get(root) !== entry || !isWorkspaceActive(team)) return;
+    // 누른 사람이 그 스레드에서 물은 것으로 본 흐름(handle)에 태운다 — 그 사람의 와탭 토큰으로 묻고, 답은 알림
+    // 스레드에 남고, 로그인 링크만 본인에게 보인다. 조치안이 오면 [조치 실행] 버튼도 그 사람에게 묶인다.
+    // 질문은 받아들인 알림의 칸으로만 만든 사건 글이다(SRE Argus 가 코드로 읽는 모양, webhook-alerts.ts).
+    await handle({
+      text: incidentPrompt(entry.alert),
+      pcode: Number(entry.alert.project),
+      userId,
+      teamId: team,
+      isDm: false,
+      threadKey: `${channel}:${root}`,
+      threadTs: root,
+      say: ((args: { text: string; thread_ts?: string; blocks?: unknown[] }) =>
+        client.chat.postMessage({
+          channel,
+          text: args.text,
+          thread_ts: args.thread_ts,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          blocks: args.blocks as any,
+        })) as Parameters<typeof handle>[0]["say"],
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       client: client as any,
     });
@@ -775,17 +1215,31 @@ async function main() {
     const op = m[1] as "apply" | "cancel";
     const token = m[2];
 
-    // Historical messages still carry these buttons. OAuth never authorizes
-    // the legacy cookie API, even when shared/default credentials remain set.
-    if (whatapLogin) {
-      await client.chat.postEphemeral({
-        channel,
-        user: userId,
-        text: ":lock: 이전 적용/취소 버튼은 와탭 로그인 모드에서 사용할 수 없어요. 새 질문으로 다시 확인해 주세요.",
-        thread_ts: threadTs,
-      });
-      return;
-    }
+    // 누른 버튼 줄을 바로 "처리 중"으로 바꿔 두 번 누르지 않게 하고, 끝나면 결과 상태를 남긴다.
+    // 원래 메시지 blocks 가 없으면(이벤트에 안 실려 온 경우) 건너뛴다. null 은 버튼 되돌리기.
+    const message = (body as { message?: { ts?: string; text?: string; blocks?: unknown[] } }).message;
+    const value = String((action as { value?: string }).value ?? "");
+    const chipLabel = value && value !== token ? value : "";
+    let chipTouched = false;
+    const setChipState = async (status: string | null) => {
+      const original = message?.blocks;
+      if (!message?.ts || !Array.isArray(original)) return;
+      if (status === null && !chipTouched) return;
+      const blocks = status === null ? original : resolveChipBlocks(original, token, status);
+      if (!blocks) return;
+      chipTouched = status !== null;
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        await client.chat.update({ channel, ts: message.ts, blocks: blocks as any, text: message.text || " " });
+      } catch (err) {
+        console.warn(`[argus-slack-bot] chip state update failed: ${(err as Error).message}`);
+      }
+    };
+    const pendingStatus = op === "apply" ? ":hourglass_flowing_sand: 적용하는 중…" : ":hourglass_flowing_sand: 취소하는 중…";
+    const stamp = () => {
+      const now = new Date();
+      return `<@${userId}> · <!date^${Math.floor(now.getTime() / 1000)}^{time}|${now.toISOString().slice(11, 16)} UTC>`;
+    };
 
     if (!ARGUS_URL) {
       await client.chat.postEphemeral({
@@ -797,39 +1251,80 @@ async function main() {
       return;
     }
 
-    // chipActionsToBlocks 와 동일한 폴백 정책 — default cookie 도 인정.
-    // 한 쪽만 default 인지하면 'chip 은 보이는데 클릭하면 미등록 안내' UX 절벽.
-    const resolved = resolveUserCreds(userId, tokenStore);
-    const creds = resolved?.creds;
-    if (!creds || !creds.argusCookie) {
-      await client.chat.postEphemeral({
-        channel,
-        user: userId,
-        text: `:warning: argus cookie 미등록 — DM 으로 \`cookie JSESSIONID=...\` 등록 후 다시 시도 (또는 운영자 default cookie 설정 요청)`,
-        thread_ts: threadTs,
-      });
-      return;
-    }
-
     const path = op === "apply" ? "/v1/event-rules/apply" : "/v1/event-rules/cancel";
-    let resp: Response;
-    try {
-      resp = await fetch(`${ARGUS_URL}${path}`, {
+    const post = (headers: Record<string, string>) =>
+      fetch(`${ARGUS_URL}${path}`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Cookie: creds.argusCookie,
-          ...(ARGUS_API_TOKEN ? { "X-Argus-Token": ARGUS_API_TOKEN } : {}),
-        },
+        headers: { "Content-Type": "application/json", ...headers },
         body: JSON.stringify({ confirmToken: token }),
       });
-    } catch (err) {
-      await client.chat.postMessage({
+
+    let resp: Response;
+    let loginCtx: PrivateReplyContext | undefined;
+    if (whatapLogin) {
+      // 와탭 로그인 모드: 미리보기를 낸 그 사용자의 토큰으로 적용한다. cookie·공용 자격증명은
+      // 보지도 보내지도 않는다. argus 가 401 이면 토큰을 한 번 갱신해 다시 보낸다.
+      const login = whatapLogin;
+      const teamId =
+        (body as { team?: { id?: string } }).team?.id ||
+        (body as { user?: { team_id?: string } }).user?.team_id || "";
+      if (!/^T[A-Z0-9]+$/.test(teamId) || !userId || !isWorkspaceActive(teamId)) return;
+      loginCtx = {
+        teamId,
+        userId,
+        isDm: false,
         channel,
-        thread_ts: threadTs,
-        text: humanizeError(err),
-      });
-      return;
+        threadTs,
+        // isDm=false 라 로그인 링크는 언제나 ephemeral 로 간다. say 는 쓰이지 않지만 형식상 둔다.
+        say: (args) => client.chat.postEphemeral({ channel, user: userId, text: args.text, thread_ts: args.thread_ts }),
+        client,
+      };
+      await setChipState(pendingStatus);
+      try {
+        resp = await login.manager.withAccessToken(teamId, userId, async (accessToken) => {
+          const r = await post({ Authorization: `Bearer ${accessToken}` });
+          if (r.status === 401) throw Object.assign(new Error("argus rejected the access token"), { status: 401 });
+          return r;
+        });
+      } catch (err) {
+        // 적용 전에 막혔으니 버튼을 되돌려 둔다(로그인·재시도 뒤 다시 누를 수 있게).
+        await setChipState(null);
+        if (err instanceof LoginRequiredError) {
+          await sendWhatapLoginLink(login, loginCtx, loginLinkLead(err));
+          return;
+        }
+        await client.chat.postMessage({ channel, thread_ts: threadTs, text: humanizeError(err, { whatapLogin: true }) });
+        return;
+      }
+    } else {
+      // chipActionsToBlocks 와 동일한 폴백 정책 — default cookie 도 인정.
+      // 한 쪽만 default 인지하면 'chip 은 보이는데 클릭하면 미등록 안내' UX 절벽.
+      const resolved = resolveUserCreds(userId, tokenStore);
+      const creds = resolved?.creds;
+      if (!creds || !creds.argusCookie) {
+        await client.chat.postEphemeral({
+          channel,
+          user: userId,
+          text: `:warning: argus cookie 미등록 — DM 으로 \`cookie JSESSIONID=...\` 등록 후 다시 시도 (또는 운영자 default cookie 설정 요청)`,
+          thread_ts: threadTs,
+        });
+        return;
+      }
+      await setChipState(pendingStatus);
+      try {
+        resp = await post({
+          Cookie: creds.argusCookie,
+          ...(ARGUS_API_TOKEN ? { "X-Argus-Token": ARGUS_API_TOKEN } : {}),
+        });
+      } catch (err) {
+        await setChipState(null);
+        await client.chat.postMessage({
+          channel,
+          thread_ts: threadTs,
+          text: humanizeError(err),
+        });
+        return;
+      }
     }
 
     let bodyJson: Record<string, unknown> = {};
@@ -840,51 +1335,155 @@ async function main() {
     }
 
     if (!resp.ok) {
+      // front 가 쓰기 허락이 없는 토큰을 막았다(403 insufficient_scope). 아무것도 바뀌지 않았으니
+      // 버튼을 되돌리고, 다시 허락받을 링크를 나에게만 보낸다. 허락한 뒤 같은 버튼을 다시 누르면 된다.
+      if (whatapLogin && loginCtx && missingScope(resp.status, resp.headers.get("www-authenticate")) !== null) {
+        await setChipState(null);
+        await sendWhatapLoginLink(whatapLogin, loginCtx, WRITE_CONSENT_LEAD);
+        return;
+      }
+      const code = bodyJson["code"];
       const errMsg = (bodyJson["error"] as string) || `HTTP ${resp.status}`;
+      const friendly = whatapLogin ? describeEventRuleOpError(code) : "";
+      // 만료된 확인은 다시 눌러도 소용없으니 버튼을 거둔다. 그 밖의 거절은 버튼을 되돌려 둔다.
+      if (code === "token_not_found") await setChipState(`:hourglass: 만료됨 — 확인 버튼은 5분 동안만 유효해요`);
+      else await setChipState(null);
       await client.chat.postMessage({
         channel,
         thread_ts: threadTs,
-        text: `:x: ${op} 실패: \`${errMsg}\``,
+        text: friendly || `:x: ${op} 실패: \`${errMsg}\``,
       });
       return;
     }
 
-    if (op === "cancel") {
-      await client.chat.postMessage({
-        channel,
-        thread_ts: threadTs,
-        text: `:wastebasket: 적용 취소 완료`,
-      });
-      return;
-    }
-
-    // apply 결과 — ApplyResult 의 summary 로 짧게 보고.
-    const action2 = (bodyJson["action"] as string) || "";
-    const summary = (bodyJson["summary"] as Record<string, number>) || {};
-    const elapsed = (bodyJson["elapsedMs"] as number) || 0;
-    const succeeded = (bodyJson["succeeded"] as unknown[]) || [];
-    const failed = (bodyJson["failed"] as unknown[]) || [];
-    const verb =
-      action2 === "create" ? "생성" : action2 === "update" ? "수정" : action2 === "delete" ? "삭제" : "적용";
-    const succN = succeeded.length;
-    const failN = failed.length;
-    const skipN = (summary["skipped"] as number) || 0;
-    const parts = [`:white_check_mark: ${succN}개 ${verb}`];
-    if (skipN > 0) parts.push(`${skipN}개 skip`);
-    if (failN > 0) parts.push(`:x: ${failN}개 실패`);
-    parts.push(`(${(elapsed / 1000).toFixed(1)}s)`);
+    // 결과 — 무엇이(버튼의 대상 이름) 어느 프로젝트에 어떻게 됐는지. 버튼 자리는 결과 상태로 바꾼다.
+    const result = describeApplyResult(op, bodyJson, chipLabel);
+    await setChipState(`${chipStatus(op, bodyJson)} · ${stamp()}`);
     await client.chat.postMessage({
       channel,
       thread_ts: threadTs,
-      text: parts.join(" · "),
+      text: result.text,
     });
+    // 와탭 로그인 모드에서 허락이 빠져 실패했으면 다시 허락받을 링크를 나에게만 보낸다.
+    if (result.needsConsent && whatapLogin && loginCtx) {
+      await sendWhatapLoginLink(whatapLogin, loginCtx, WRITE_CONSENT_LEAD);
+    }
   });
 
-  // 추천 후속 질문 chip 클릭 핸들러. action_id = `followup_question:<index>`,
-  // value = 질문 텍스트 (action_id 길이 제한 우회용 — 인덱스만 박고 value 에 텍스트).
-  // 클릭 시 같은 thread 의 새 turn 으로 handle() 재호출 — 사용자가 직접 입력한
+  // OPM 조치안 버튼 — [조치 실행]·[취소]·[상태 확인]. action_id 는 `opm_action:<op>:<손잡이>` 이고,
+  // 확인 토큰은 손잡이로 봇 메모리(opmChips)에서 꺼낸다. 와탭 로그인 모드에서만 그리고 처리한다.
+  app.action(/^opm_action:(apply|cancel|check):[\w-]+$/, async (ctx) => {
+    const { ack, body, client, action } = ctx;
+    await ack();
+    const login = whatapLogin;
+    if (!login) return;
+    const userId = (body as { user?: { id?: string } }).user?.id || "";
+    const teamId =
+      (body as { team?: { id?: string } }).team?.id ||
+      (body as { user?: { team_id?: string } }).user?.team_id || "";
+    if (!/^T[A-Z0-9]+$/.test(teamId) || !userId || !isWorkspaceActive(teamId)) return;
+    const m = ((action as { action_id?: string }).action_id || "").match(/^opm_action:(apply|cancel|check):([\w-]+)$/);
+    if (!m) return;
+    const op = m[1] as OpmOp;
+    const handle = m[2];
+    const channel =
+      (body as { channel?: { id?: string } }).channel?.id ||
+      (body as { container?: { channel_id?: string } }).container?.channel_id || "";
+    const message = (body as { message?: { ts?: string; thread_ts?: string; text?: string; blocks?: unknown[] } }).message;
+    const threadTs = message?.thread_ts || message?.ts || undefined;
+    const tellClicker = (text: string) => client.chat.postEphemeral({ channel, user: userId, text, thread_ts: threadTs });
+    const entry = opmChips.get(handle);
+    if (!entry) {
+      // 봇이 다시 시작됐거나 오래돼 토큰을 잊었다. 눌러도 소용없는 버튼은 거두고, 누른 사람에게만 알린다.
+      const retired = Array.isArray(message?.blocks)
+        ? replaceOpmRow(message.blocks, handle, opmStatusRow(handle, ":hourglass: 더 쓸 수 없는 버튼이에요"))
+        : undefined;
+      if (retired && message?.ts) {
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          await client.chat.update({ channel, ts: message.ts, blocks: retired as any, text: message.text || " " });
+        } catch (err) {
+          console.warn(`[argus-slack-bot] opm chip state update failed: ${(err as Error).message}`);
+        }
+      }
+      await tellClicker(":hourglass: 이 조치안 버튼은 더 쓸 수 없어요(봇이 다시 시작됐거나 시간이 많이 지났어요). 같은 내용을 다시 물어봐 주세요.");
+      return;
+    }
+    if (entry.teamId !== teamId || entry.userId !== userId) {
+      // argus 도 토큰을 받은 사람에 묶지만, 남의 확인 토큰을 내 와탭 토큰에 실어 보내는 일 자체를 하지 않는다.
+      await tellClicker(":lock: 다른 사람의 질문에서 나온 조치안이에요. 본인 질문의 버튼만 누를 수 있어요.");
+      return;
+    }
+
+    // 누른 버튼 줄을 바로 상태 줄로 바꿔 두 번 누르지 않게 하고, 끝나면 결과 상태를 남긴다. null 은 버튼 되돌리기.
+    let touched = false;
+    const setRow = async (replacement: unknown[] | null) => {
+      const original = message?.blocks;
+      if (!message?.ts || !Array.isArray(original)) return;
+      if (replacement === null && !touched) return;
+      const blocks = replacement === null ? original : replaceOpmRow(original, handle, replacement);
+      if (!blocks) return;
+      touched = replacement !== null;
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        await client.chat.update({ channel, ts: message.ts, blocks: blocks as any, text: message.text || " " });
+      } catch (err) {
+        console.warn(`[argus-slack-bot] opm chip state update failed: ${(err as Error).message}`);
+      }
+    };
+    const loginCtx: PrivateReplyContext = {
+      teamId,
+      userId,
+      isDm: false,
+      channel,
+      threadTs,
+      say: (args) => client.chat.postEphemeral({ channel, user: userId, text: args.text, thread_ts: args.thread_ts }),
+      client,
+    };
+
+    await setRow(opmStatusRow(handle, OPM_PENDING[op]));
+    let resp: Response;
+    let bodyJson: Record<string, unknown>;
+    try {
+      ({ resp, body: bodyJson } = await callOpm(login, teamId, userId, op, entry.token));
+    } catch (err) {
+      await setRow(null);
+      if (err instanceof LoginRequiredError) {
+        await sendWhatapLoginLink(login, loginCtx, loginLinkLead(err));
+        return;
+      }
+      // 보낸 뒤 끊겼을 수 있다. argus 는 같은 조치안을 두 번 실행하지 않으니 다시 눌러 확인하게 한다.
+      await client.chat.postMessage({
+        channel,
+        thread_ts: threadTs,
+        text: op === "apply" ? OPM_NO_ANSWER : humanizeError(err, { whatapLogin: true }),
+      });
+      return;
+    }
+    if (!resp.ok) {
+      // front 가 쓰기 허락이 없는 토큰을 막았다(403 insufficient_scope). 실행하지 않았으니 버튼을 되돌리고,
+      // 다시 허락받을 링크를 나에게만 보낸다. 허락한 뒤 같은 버튼을 다시 누르면 된다.
+      if (missingScope(resp.status, resp.headers.get("www-authenticate")) !== null) {
+        await setRow(null);
+        await sendWhatapLoginLink(login, loginCtx, OPM_CONSENT_LEAD);
+        return;
+      }
+      const view = describeOpmError(op, resp.status, bodyJson, entry.title);
+      if (view.row === "restore") await setRow(null);
+      else await setRow(opmStatusRow(handle, `${view.status} · ${opmStamp(userId)}`, view.check));
+      await client.chat.postMessage({ channel, thread_ts: threadTs, text: view.text });
+      return;
+    }
+    const outcome = describeOpmOutcome(op, bodyJson, entry.title);
+    await setRow(opmStatusRow(handle, `${outcome.status} · ${opmStamp(userId)}`, outcome.check));
+    await client.chat.postMessage({ channel, thread_ts: threadTs, text: outcome.text });
+  });
+
+  // 답변 아래 버튼 클릭 핸들러 — 추천 후속 질문(`followup_question:<index>`)과 argus 선택지
+  // (`choose_option:<index>`). value = 보낼 텍스트 (action_id 길이 제한 우회용 — 인덱스만 박고
+  // value 에 텍스트). 클릭 시 같은 대화의 새 turn 으로 handle() 재호출 — 사용자가 직접 입력한
   // 것처럼 동작.
-  app.action(/^followup_question:.+$/, async (ctx) => {
+  app.action(/^(followup_question|choose_option):.+$/, async (ctx) => {
     const { ack, body, client, action } = ctx;
     const teamId =
       (body as { team?: { id?: string } }).team?.id ||
@@ -902,18 +1501,26 @@ async function main() {
       "";
     const message = (body as { message?: { thread_ts?: string; ts?: string } })
       .message;
-    const threadTs = message?.thread_ts || message?.ts || "";
-    if (!channel || !threadTs || !userId) return;
+    // DM 본문 답변의 버튼(block_id 에 표시)은 DM 본문 대화를 잇고 본문에 답한다. 그 밖(채널 스레드,
+    // 스레드 안 답변, 표시 없는 예전 메시지)은 그 메시지의 스레드가 대화다.
+    // 답글이 달린 본문 메시지는 스레드의 첫 글이라 thread_ts 가 자기 ts 와 같다 — 봇이 적용 결과를 미리보기
+    // 답변의 스레드에 달면 그렇게 된다. 스레드 "안" 의 메시지만 thread_ts 가 ts 와 다르다.
+    const blockId = String((action as { block_id?: string }).block_id ?? "");
+    const insideThread = !!message?.thread_ts && message.thread_ts !== message.ts;
+    const dmMain = !insideThread && blockId.endsWith(DM_MAIN_BLOCK_SUFFIX);
+    const threadTs = dmMain ? undefined : message?.thread_ts || message?.ts || "";
+    if (!channel || !userId || (!dmMain && !threadTs)) return;
 
     const question = (action as { value?: string }).value || "";
     if (!question) return;
-    const threadKey = `${channel}:${threadTs}`;
+    const threadKey = dmMain ? dmMainThreadKey(channel) : `${channel}:${threadTs}`;
+    const chosen = String((action as { action_id?: string }).action_id ?? "").startsWith("choose_option:");
 
     // 채널에 "<@user> selected: <질문>" 박아 다른 사람들도 맥락 유지.
     await client.chat.postMessage({
       channel,
       thread_ts: threadTs,
-      text: `<@${userId}> _후속 질문 선택:_ ${question}`,
+      text: `<@${userId}> ${chosen ? "_선택:_" : "_후속 질문 선택:_"} ${question}`,
     });
 
     // handle() 재호출 — say 를 client.chat.postMessage 로 래핑.
@@ -994,6 +1601,16 @@ interface WhatapLoginRuntime {
   manager: WhatapTokenManager;
 }
 
+/** 자동 대응이 쓰는 Slack 호출(이벤트의 워크스페이스 client, 또는 타이머가 설치 토큰으로 만든 client). */
+interface OncallSlack {
+  chat: {
+    postMessage: (args: { channel: string; text: string; thread_ts?: string; blocks?: unknown[] }) => Promise<unknown>;
+    postEphemeral: (args: { channel: string; user: string; text: string; thread_ts?: string }) => Promise<unknown>;
+  };
+}
+/** 받아들인 알림(webhook-alerts.ts readAlert). */
+type AlertRead = NonNullable<ReturnType<typeof readAlert>>;
+
 /** 본인만 봐야 하는 답(로그인 링크, 연결 계정)을 보낼 곳. DM 이면 DM, 채널이면 ephemeral. */
 interface PrivateReplyContext {
   teamId: string;
@@ -1027,23 +1644,56 @@ async function replyPrivately(ctx: PrivateReplyContext, text: string): Promise<v
   });
 }
 
+/** 쓰던 연결이 만료됐을 때(오래 안 써서 refresh 가 거절됨 등) 링크 앞에 붙이는 안내.
+ *  처음 연결하는 사람과 같은 안내를 받으면 왜 다시 로그인해야 하는지 알 수 없다. */
+const LOGIN_EXPIRED_LEAD = ":lock: 와탭 로그인이 만료됐어요. 아래 링크로 다시 연결해 주세요.";
+/** 자동 대응을 켜려는데 쓸 수 있는 와탭 연결이 없을 때. */
+const ONCALL_LOGIN_LEAD = ":lock: 자동 대응은 당번의 와탭 권한으로 분석하고 조치해요. 아래 링크로 와탭 계정을 연결한 뒤 `자동 대응 켜기` 를 다시 보내 주세요.";
+/** 당번의 와탭 로그인을 쓸 수 없어 자동 대응이 멈췄을 때 당번에게만 보내는 링크 안내. */
+const ONCALL_EXPIRED_LEAD = ":lock: 와탭 로그인이 필요해 자동 대응이 멈췄어요. 아래 링크로 다시 연결하면 다음 알림부터 이어서 해요.";
+
+function loginLinkLead(err: LoginRequiredError): string | undefined {
+  return err.expired ? LOGIN_EXPIRED_LEAD : undefined;
+}
+
+/**
+ * OPM 조치 API(argus /v1/opm/actions/{op})를 그 사용자의 와탭 토큰으로 부른다. [조치 실행] 버튼과 자동 대응이 같이 쓴다.
+ * argus 가 401 이면 토큰을 한 번 갱신해 다시 보낸다(withAccessToken). 본문은 JSON 이 아니면 빈 객체다.
+ */
+async function callOpm(login: WhatapLoginRuntime, teamId: string, userId: string, op: OpmOp, confirmToken: string) {
+  const resp = await login.manager.withAccessToken(teamId, userId, async (accessToken) => {
+    const r = await postOpmAction(fetch, ARGUS_URL, op, accessToken, confirmToken);
+    if (r.status === 401) throw Object.assign(new Error("argus rejected the access token"), { status: 401 });
+    return r;
+  });
+  let body: Record<string, unknown> = {};
+  try {
+    body = (await resp.json()) as Record<string, unknown>;
+  } catch {
+    body = {};
+  }
+  return { resp, body };
+}
+
 /** 로그인 링크는 그 Slack 사용자에게 묶여 있어 채널에 공개하면 다른 사람이 자기 와탭
  *  계정을 그 사용자에게 연결할 수 있다. 그래서 항상 본인에게만 보낸다. */
 async function sendWhatapLoginLink(
   rt: WhatapLoginRuntime,
   ctx: PrivateReplyContext,
+  /** 로그인 대신 허락을 다시 받을 때처럼 이유가 따로 있으면 첫 줄을 바꾼다. */
+  lead?: string,
 ): Promise<void> {
   const url = loginStartUrl(
     rt.settings.oauth.redirectUri,
     rt.pending.create(ctx.teamId, ctx.userId),
   );
+  const link = `<${url}|와탭 로그인 열기> 링크는 10분 동안 쓸 수 있고 나에게만 보여요.`;
   await replyPrivately(
     ctx,
-    [
-      ":key: 와탭 계정을 연결하면 내 권한으로 조회한 답을 받을 수 있어요.",
-      `<${url}|와탭 로그인 열기> 링크는 10분 동안 쓸 수 있고 나에게만 보여요.`,
-      ACCOUNT_SETUP_GUIDANCE,
-    ].join("\n"),
+    (lead
+      ? [lead, link]
+      : [":key: 와탭 계정을 연결하면 내 권한으로 조회한 답을 받을 수 있어요.", link, ACCOUNT_SETUP_GUIDANCE]
+    ).join("\n"),
   );
 }
 
@@ -1061,12 +1711,31 @@ async function handleWhatapLoginCommand(
       return;
     case "whoami": {
       const link = rt.store.get(ctx.teamId, ctx.userId);
-      await replyPrivately(
-        ctx,
-        link
-          ? `:bust_in_silhouette: 와탭 계정이 연결돼 있어요: ${link.email ?? link.subject}`
-          : "연결된 와탭 계정이 없어요. `login` 을 보내 연결하세요.",
-      );
+      if (!link) {
+        await replyPrivately(ctx, "연결된 와탭 계정이 없어요. `login` 을 보내 연결하세요.");
+        return;
+      }
+      // 저장된 연결이 있어도 로그인 서버가 refresh 를 거절하면(오래 안 씀 등) 쓸 수 없다. 실제로 확인한다.
+      try {
+        await rt.manager.accessToken(ctx.teamId, ctx.userId);
+      } catch (err) {
+        if (err instanceof LoginRequiredError) {
+          await replyPrivately(
+            ctx,
+            err.expired
+              ? ":lock: 와탭 로그인이 만료됐어요. `login` 을 보내 다시 연결하세요."
+              : "연결된 와탭 계정이 없어요. `login` 을 보내 연결하세요.",
+          );
+          return;
+        }
+        console.warn(`[argus-slack-bot] whoami token check failed user=${ctx.userId}: ${String(err)}`);
+        await replyPrivately(
+          ctx,
+          `:bust_in_silhouette: 와탭 계정이 연결돼 있어요: ${link.email ?? link.subject} (로그인 서버에 닿지 않아 지금 쓸 수 있는지는 확인하지 못했어요)`,
+        );
+        return;
+      }
+      await replyPrivately(ctx, `:bust_in_silhouette: 와탭 계정이 연결돼 있어요: ${link.email ?? link.subject}`);
       return;
     }
     case "logout": {
@@ -1374,7 +2043,13 @@ const STATIC_FOLLOWUP_FALLBACK = [
   "이상 징후 찾아줘",
 ];
 
-function recommendedQuestionsToBlocks(questions: string[]): unknown[] {
+/**
+ * DM 본문 답변의 버튼 줄 block_id 끝에 붙이는 표시. 클릭 핸들러가 이걸 보고 DM 본문 대화를 잇는다.
+ * block_id 를 주지 않은 줄에는 Slack 이 짧은 임의 문자열을 붙이므로 이 표시와 겹치지 않는다.
+ */
+const DM_MAIN_BLOCK_SUFFIX = "_dm_main";
+
+function recommendedQuestionsToBlocks(questions: string[], dmMain = false): unknown[] {
   if (questions.length === 0) return [];
   // Slack action 블록은 한 row 에 element 최대 25개. 라벨 75자 제한.
   // argus 가 보통 3개라 충분.
@@ -1394,7 +2069,29 @@ function recommendedQuestionsToBlocks(questions: string[]): unknown[] {
         { type: "mrkdwn", text: ":sparkles: *추천 후속 질문 — 클릭하면 자동 전송:*" },
       ],
     },
-    { type: "actions", elements },
+    { type: "actions", ...(dmMain ? { block_id: `followup${DM_MAIN_BLOCK_SUFFIX}` } : {}), elements },
+  ];
+}
+
+/** argus 선택지(render_options) → Block Kit button. 누르면 value 가 같은 대화의 다음 메시지로 간다. */
+function optionsToBlocks(options: Array<{ label: string; value: string }>, dmMain = false): unknown[] {
+  // Slack 한도: actions 블록 하나에 element 25개, 버튼 글자 75자, value 2000자. 넘으면 메시지 전체가 거절된다.
+  const shown = options.filter((o) => o.value.length <= 2000).slice(0, 25);
+  if (shown.length === 0) return [];
+  const elements = shown.map((o, i) => ({
+    type: "button",
+    text: { type: "plain_text", text: o.label.length > 75 ? o.label.slice(0, 72) + "..." : o.label },
+    action_id: `choose_option:${i}`,
+    value: o.value,
+  }));
+  const hidden = options.length - shown.length;
+  const note = hidden > 0 ? ` _(${hidden}개는 버튼에 담지 못했어요. 직접 입력해 주세요.)_` : "";
+  return [
+    {
+      type: "context",
+      elements: [{ type: "mrkdwn", text: `:point_right: *선택지 — 클릭하면 자동 전송:*${note}` }],
+    },
+    { type: "actions", ...(dmMain ? { block_id: `options${DM_MAIN_BLOCK_SUFFIX}` } : {}), elements },
   ];
 }
 
@@ -1451,6 +2148,9 @@ function composeStreamingBody(args: {
 
 import type { ChipAction } from "./claude-loop.js";
 
+/** 봇이 /v1/event-rules/{apply,cancel} 로 처리하는 chip type (기본·복합 메트릭스 이벤트 모두 이 두 type). */
+const EVENT_RULE_CHIP_TYPES = new Set(["applyEventRules", "cancelEventRules"]);
+
 // chipActionsToBlocks — argus 도구 응답에서 추출된 chip actions 를 Slack Block
 // Kit `actions` 블록(button row) 으로 변환. action_id 에 confirmToken 박아서
 // 클릭 시 추적 가능. action_id 길이 제한 255자라 token 자체가 길면 잘릴 수
@@ -1471,18 +2171,26 @@ import type { ChipAction } from "./claude-loop.js";
 // 같은 turn 에 여러 chip 쌍이 발급된 경우 (예: Critical + Warning 룰 두 번 등록)
 // 각 쌍이 별도 row 로 보임. 한 row 에 너무 많이 쏟으면 Slack UX 떨어짐.
 //
-// creds.argusCookie 없으면 chip 표시 자체를 안 함 — argus 의
-// /v1/event-rules/{apply,cancel} 핸들러가 chat.CookieAuthMiddleware 라 token
-// 만으론 401. chip 보여주고 클릭 후 거부하는 것보다 표시 안 하는 게 UX 일관성
-// ↑. 호출자가 "cookie 없음" 안내를 답변 본문에 추가 (renderCookieGateHint 참고).
-function chipActionsToBlocks(actions: ChipAction[], creds: UserCreds): unknown[] {
-  if (actions.length === 0) return [];
-  if (!creds.argusCookie) return [];
+// 레거시 모드에서 creds.argusCookie 없으면 호출자가 chip 을 붙이지 않는다 — argus 의
+// /v1/event-rules/{apply,cancel} 가 cookie 인증이라 token 만으론 401. chip 보여주고
+// 클릭 후 거부하는 것보다 표시 안 하는 게 UX 일관성 ↑ (renderCookieGateHint 참고).
+// 와탭 로그인 모드에선 argus 가 같은 경로에서 사용자 토큰을 받으므로 항상 붙인다.
+function chipActionsToBlocks(actions: ChipAction[] | undefined): unknown[] {
+  if (!actions || actions.length === 0) return [];
 
   // apply / cancel 을 한 row 에 묶어 보기. 같은 confirmToken 끼리.
   const byToken = new Map<string, ChipAction[]>();
   let droppedBrowserChips = 0;
   for (const a of actions) {
+    // 확인 토큰이 있어도 알림 규칙 chip 이 아니면 여기서 그리지 않는다 — 누르면 알림 규칙 API 를 부르기 때문이다.
+    // OPM 조치안은 opmChipBlocks 가 따로 그린다.
+    if (!EVENT_RULE_CHIP_TYPES.has(a.type)) {
+      if (a.type !== OPM_CHIP_TYPE && a.payload?.["confirmToken"]) {
+        console.log(`[argus-slack-bot] dropped chip with unknown type=${a.type}`);
+      }
+      if (!a.payload?.["confirmToken"]) droppedBrowserChips++;
+      continue;
+    }
     const token = (a.payload?.["confirmToken"] as string) || "";
     if (!token) {
       // 브라우저용 chip (applyDashboard / addWidgets / addFlexboardWidgets)
@@ -1501,6 +2209,9 @@ function chipActionsToBlocks(actions: ChipAction[], creds: UserCreds): unknown[]
 
   const blocks: unknown[] = [];
   for (const [token, group] of byToken) {
+    // 버튼 위에 미리보기 — 답변 문장과 상관없이 무엇이 어떻게 바뀌는지 보여 준다.
+    const preview = renderRulePreview(group.find((a) => a.type === "applyEventRules")?.payload);
+    if (preview) blocks.push({ type: "section", text: { type: "mrkdwn", text: preview } });
     const elements = group.map((a) => {
       const isApply = a.type === "applyEventRules";
       return {
@@ -1512,7 +2223,8 @@ function chipActionsToBlocks(actions: ChipAction[], creds: UserCreds): unknown[]
         // action_id 에 type prefix + token 박아서 핸들러가 분기.
         action_id: `${isApply ? "apply" : "cancel"}_event_rule:${token}`,
         style: isApply ? "primary" : undefined,
-        value: token,
+        // value 는 결과 문장에 쓸 대상 이름. 토큰은 action_id 에 있다.
+        value: String(a.payload?.["targetLabel"] ?? "").slice(0, 150) || token,
       };
     });
     blocks.push({ type: "actions", elements });
@@ -1521,13 +2233,14 @@ function chipActionsToBlocks(actions: ChipAction[], creds: UserCreds): unknown[]
 }
 
 // withTextSection — text chunk 를 section block 으로 감싸고 chip blocks 를
-// 뒤에 붙임. blocks 가 비면 undefined 반환 (fallback to text-only).
-function withTextSection(text: string, chipBlocks: unknown[]): unknown[] | undefined {
-  if (chipBlocks.length === 0) return undefined;
+// 뒤에(before 는 앞에) 붙임. blocks 가 비면 undefined 반환 (fallback to text-only).
+function withTextSection(text: string, chipBlocks: unknown[], before: unknown[] = []): unknown[] | undefined {
+  if (chipBlocks.length === 0 && before.length === 0) return undefined;
   // Slack section block text 는 3000자 제한. 그 이상이면 splitForSlack 가 이미
   // 잘랐을 텐데 안전하게 한 번 더 truncate.
   const safeText = text.length > 2900 ? text.slice(0, 2897) + "..." : text;
   return [
+    ...before,
     { type: "section", text: { type: "mrkdwn", text: safeText } },
     ...chipBlocks,
   ];

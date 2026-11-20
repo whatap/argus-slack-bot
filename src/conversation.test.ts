@@ -226,3 +226,31 @@ test("uninstall invalidates an in-flight history view even after a new installat
     assert.throws(() => th.deleteWorkspace(""), /workspace ID/);
   } finally { th.close(); }
 });
+
+test("workspace-scoped reset forgets one conversation only, and does nothing after an uninstall", () => {
+  const th = new ThreadHistory(10, 30 * 60 * 1000, dbPath);
+  try {
+    const a = th.forWorkspace("T1");
+    const b = th.forWorkspace("T10");
+    for (const ws of [a, b]) {
+      ws.appendTurn("D1:dm#U1", [{ role: "user", content: "question" }]);
+      ws.setArgusConvId("D1:dm#U1", "conv-old");
+    }
+    a.setArgusConvId("D1:9.9#U1", "conv-thread");
+
+    a.reset("D1:dm#U1");
+    assert.deepEqual(a.get("D1:dm#U1").history, []);
+    assert.equal(a.get("D1:dm#U1").argusConversationId, undefined);
+    assert.equal(a.get("D1:9.9#U1").argusConversationId, "conv-thread", "other conversations are kept");
+    assert.equal(b.get("D1:dm#U1").argusConversationId, "conv-old", "other workspaces are kept");
+    a.setArgusConvId("D1:dm#U1", "conv-new");
+    assert.equal(a.get("D1:dm#U1").argusConversationId, "conv-new", "a forgotten conversation can be replaced");
+
+    th.deleteWorkspace("T10");
+    const reinstalled = th.forWorkspace("T10");
+    reinstalled.setArgusConvId("D1:dm#U1", "conv-after-reinstall");
+    b.reset("D1:dm#U1");
+    assert.equal(reinstalled.get("D1:dm#U1").argusConversationId, "conv-after-reinstall", "a view from before the uninstall cannot reset the new installation");
+  } finally { th.close(); }
+});
+

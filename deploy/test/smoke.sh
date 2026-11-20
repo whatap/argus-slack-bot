@@ -45,7 +45,7 @@ env -i PATH=/usr/bin:/bin HOME="$W" NODE_ENV=production \
   SLACK_THREAD_HISTORY_DB="$W/data/thread_history.sqlite" \
   WHATAP_OAUTH_ISSUER=https://whatap.example.invalid WHATAP_OAUTH_CLIENT_ID=argus-slack-bot \
   WHATAP_OAUTH_CLIENT_SECRET=smoke-whatap WHATAP_OAUTH_REDIRECT_URI=https://argus-bot.example.invalid/oauth/callback \
-  WHATAP_OAUTH_PORT="$OAUTH_PORT" WHATAP_OAUTH_LISTEN_HOST=127.0.0.1 ARGUS_URL=http://127.0.0.1:9 \
+  WHATAP_OAUTH_PORT="$OAUTH_PORT" WHATAP_OAUTH_LISTEN_HOST=127.0.0.1 ARGUS_URL=https://whatap.example.invalid/argus \
   "$NODE" dist/index.js > "$W/bot.log" 2>&1 &
 BOT_PID=$!
 

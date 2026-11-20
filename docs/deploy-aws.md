@@ -7,8 +7,10 @@ Slack 서버 · 사용자 브라우저
   → https://argus-bot.whatap.io (ALB, TLS)
   → EC2 1대   :3000  /slack/*  /  /privacy  /terms  /support
               :3901  /oauth/start  /oauth/callback
-EC2 → slack.com · service.whatap.io(와탭 로그인) · Argus /v1/agent
+EC2 → slack.com · service.whatap.io(와탭 로그인, 그리고 front /argus 를 거쳐 Argus)
 ```
+
+봇은 Argus 를 직접 부르지 않는다. 사용자 토큰은 front 의 `/argus/v1/**` 로만 보내고, front 가 경로마다 scope 를 확인한 뒤 내부 Argus 로 넘긴다. 그래서 봇 서버에서 Argus 내부 ALB 로 가는 연결(보안그룹 규칙)은 필요 없다. 나가는 연결은 443 뿐이다.
 
 반드시 1대다. SQLite 파일과 진행 중인 로그인 상태(메모리)를 프로세스 하나가 들고 있어서 여러 대·오토스케일·서버리스는 안 된다.
 

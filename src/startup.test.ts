@@ -72,7 +72,7 @@ test("real entrypoint starts HTTP OAuth mode without Socket, Anthropic or MCP cr
       WHATAP_OAUTH_ISSUER: "http://127.0.0.1:1", WHATAP_OAUTH_CLIENT_ID: "whatap-test",
       WHATAP_OAUTH_CLIENT_SECRET: "synthetic-whatap-secret", WHATAP_OAUTH_PORT: String(oauthPort),
       WHATAP_OAUTH_REDIRECT_URI: "https://bot.example.com/oauth/callback",
-      ARGUS_URL: "http://127.0.0.1:1",
+      ARGUS_URL: "http://127.0.0.1:1/argus",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });

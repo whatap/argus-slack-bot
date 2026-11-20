@@ -20,7 +20,7 @@ export interface ArgusDirectConfig {
   apiToken: string;
   /** dev.whatap.io 의 JSESSIONID — argus 가 cookie pass-through 모드 활성. */
   cookie?: string;
-  /** 와탭 로그인 access token. 있으면 /v1/agent 에 Authorization: Bearer 로만 보낸다
+  /** 와탭 로그인 access token. 있으면 front 의 /argus/v1/chat 에 Authorization: Bearer 로만 보낸다
    *  (cookie·X-Argus-Token 을 함께 싣지 않는다). */
   accessToken?: string;
 }
@@ -34,6 +34,21 @@ export class ArgusHttpError extends Error {
   ) {
     super(`argus ${endpoint} error (${status}): ${detail}`);
     this.name = "ArgusHttpError";
+  }
+}
+
+/**
+ * argus 가 스트림 안에서 보낸 error 이벤트. HTTP 는 200 이라 ArgusHttpError 로는 잡히지 않는다.
+ * code 는 argus 의 오류 종류다 — 예: NOT_FOUND 는 보낸 conversationId 를 argus 가 모른다는 뜻
+ * (없는 대화이거나 다른 사용자의 대화. argus 는 둘을 구분해 주지 않는다).
+ */
+export class ArgusStreamError extends Error {
+  constructor(
+    readonly code: string,
+    detail: string,
+  ) {
+    super(`argus error [${code}]: ${detail}`);
+    this.name = "ArgusStreamError";
   }
 }
 
@@ -54,6 +69,50 @@ export interface AskWhatapExpertResult {
    * argus 의 frontendActions 가 그대로 흘러 옴.
    */
   actions?: Array<{ type: string; label: string; payload: Record<string, unknown> }>;
+  /**
+   * argus 의 render_options 도구가 보낸 선택지. argus 는 답변에서 "버튼에서 고르세요" 라고 말하므로
+   * 봇이 버튼으로 그려야 한다. 누르면 value 가 사용자의 다음 메시지로 간다.
+   */
+  options?: ArgusOption[];
+  /** 선택지가 답변 글보다 먼저 왔는지. 웹 화면처럼 글 위에 그릴지 아래에 그릴지를 정한다. */
+  optionsBeforeText?: boolean;
+}
+
+/** render_options 의 선택지 하나. */
+export interface ArgusOption {
+  label: string;
+  value: string;
+}
+
+/**
+ * render_options 도구 입력(JSON)에서 선택지를 꺼낸다. argus 는 문자열 목록 또는 {label, value} 목록을
+ * 보낸다(도구 응답의 options 를 그대로 넘기는 경우). 읽을 수 없으면 빈 목록.
+ */
+export function parseOptionsInput(raw: string): ArgusOption[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  const list = (parsed as { options?: unknown } | null)?.options;
+  if (!Array.isArray(list)) return [];
+  const out: ArgusOption[] = [];
+  for (const item of list) {
+    let label = "";
+    let value = "";
+    if (typeof item === "string") {
+      label = value = item.trim();
+    } else if (item && typeof item === "object") {
+      const o = item as { label?: unknown; value?: unknown };
+      const l = typeof o.label === "string" ? o.label.trim() : "";
+      const v = typeof o.value === "string" ? o.value.trim() : "";
+      label = l || v;
+      value = v || l;
+    }
+    if (label && value && !out.some((seen) => seen.value === value)) out.push({ label, value });
+  }
+  return out;
 }
 
 const REQUEST_TIMEOUT_MS = 120_000;
@@ -72,29 +131,20 @@ export async function askWhatapExpertDirect(
   },
   onProgress: (p: ArgusProgress) => void,
 ): Promise<AskWhatapExpertResult> {
-  // 와탭 로그인 경로: /v1/agent + Bearer. AgentRequest 형식(query, context.source)이고
-  // currentUrl 필드가 없어 화면 추론 결과는 싣지 않는다.
-  //
-  // 기존 경로: /v1/chat (브라우저용, cookie 인증) — /v1/agent 의 X-Argus-Token
-  // 인증 layer 가 front.apm/nginx/ALB 어딘가에서 자체 검증되어 우회 어려움.
-  // 봇이 사용자 cookie 를 가지고 있으니 /v1/chat 으로 호출하면 토큰 무관.
-  // body field 는 ChatRequest 형식: query → message.
+  // 입구는 /v1/chat 하나다 (화면 채팅과 같은 ChatRequest: query → message).
+  // 와탭 로그인 모드에서는 front 의 /argus/v1/chat 에 사용자 토큰을 싣는다. front 가 토큰과 scope 를
+  // 확인한 뒤 그 계정의 짧은 세션으로 바꿔 argus 에 넘긴다. argus 는 토큰을 모른다 — 토큰용 입구
+  // (/v1/agent)는 argus 에서 삭제됐다.
   // context.client="slack" — argus 가 출력 채널이 텍스트 전용임을 인지해서
   // 차트·대시보드 도구 회피 + 후속 질문에서 시각화 항목 제외.
   const bearer = cfg.accessToken;
-  const endpoint = bearer ? "/v1/agent" : "/v1/chat";
-  const body: Record<string, unknown> = bearer
-    ? { query: params.query }
-    : { message: params.query };
+  const endpoint = "/v1/chat";
+  const body: Record<string, unknown> = { message: params.query };
   if (typeof params.pcode === "number") body.pcode = params.pcode;
   if (params.conversationId) body.conversationId = params.conversationId;
-  if (bearer) {
-    body.context = { source: "slack-bot" };
-  } else {
-    const context: Record<string, unknown> = { client: "slack" };
-    if (params.currentUrl) context.currentUrl = params.currentUrl;
-    body.context = context;
-  }
+  const context: Record<string, unknown> = { client: "slack" };
+  if (params.currentUrl) context.currentUrl = params.currentUrl;
+  body.context = context;
   // /v1/chat 은 Cookie 헤더에서 직접 읽음 — body.cookie 안 씀.
   const authHeaders: Record<string, string> = bearer
     ? { Authorization: `Bearer ${bearer}` }
@@ -155,6 +205,16 @@ async function consumeSSE(
   let conversationId: string | undefined;
   let recommendedQuestions: string[] | undefined;
   const actions: Array<{ type: string; label: string; payload: Record<string, unknown> }> = [];
+  // render_options 의 선택지는 tool_use 블록의 input JSON 으로 온다. 조각나 올 수 있어 블록 index 로 모은다.
+  const optionInputs = new Map<number, { raw: string; beforeText: boolean }>();
+  const options: ArgusOption[] = [];
+  let optionsBeforeText = false;
+  const takeOptions = (input: { raw: string; beforeText: boolean }) => {
+    const found = parseOptionsInput(input.raw).filter((o) => !options.some((seen) => seen.value === o.value));
+    if (found.length === 0) return;
+    if (options.length === 0) optionsBeforeText = input.beforeText;
+    options.push(...found);
+  };
 
   while (true) {
     const { value, done } = await reader.read();
@@ -169,20 +229,35 @@ async function consumeSSE(
       if (!evt) continue;
 
       if (evt.event === "error") {
-        const code = evt.data?.code ?? "ARGUS_ERROR";
-        const msg = evt.data?.message ?? JSON.stringify(evt.data);
-        throw new Error(`argus error [${code}]: ${msg}`);
+        // argus 는 { error: { type, message } } 로 보낸다 (wire/sse.go 의 ErrorEvent). 예전 모양
+        // { code, message } 도 받고, 둘 다 아니면 받은 그대로 보여 준다.
+        const e = evt.data?.error;
+        const code = [e?.type, evt.data?.code].find((v) => typeof v === "string" && v) ?? "ARGUS_ERROR";
+        const msg = [e?.message, evt.data?.message].find((v) => typeof v === "string" && v) ?? JSON.stringify(evt.data);
+        throw new ArgusStreamError(code, msg);
       }
       if (evt.event === "content_block_start") {
         const cb = evt.data?.content_block;
         if (cb?.type === "tool_use" && typeof cb.name === "string") {
           onProgress({ subTool: cb.name });
+          if (cb.name === "render_options" && typeof evt.data?.index === "number") {
+            optionInputs.set(evt.data.index, { raw: "", beforeText: text.trim() === "" });
+          }
         }
       } else if (evt.event === "content_block_delta") {
         const d = evt.data?.delta;
         if (d?.type === "text_delta" && typeof d.text === "string") {
           text += d.text;
           onProgress({ text });
+        } else if (d?.type === "input_json_delta" && typeof d.partial_json === "string") {
+          const input = optionInputs.get(evt.data?.index);
+          if (input) input.raw += d.partial_json;
+        }
+      } else if (evt.event === "content_block_stop") {
+        const input = optionInputs.get(evt.data?.index);
+        if (input) {
+          optionInputs.delete(evt.data.index);
+          takeOptions(input);
         }
       } else if (evt.event === "message_stop") {
         if (typeof evt.data?.conversationId === "string") {
@@ -215,11 +290,15 @@ async function consumeSSE(
     }
   }
 
+  // 블록을 닫는 이벤트 없이 스트림이 끝나도 받은 선택지는 쓴다.
+  for (const input of optionInputs.values()) takeOptions(input);
+
   return {
     text: sanitizeSlackText(text.trim()),
     ...(conversationId ? { conversationId } : {}),
     ...(recommendedQuestions ? { recommendedQuestions } : {}),
     ...(actions.length > 0 ? { actions } : {}),
+    ...(options.length > 0 ? { options, optionsBeforeText } : {}),
   };
 }
 

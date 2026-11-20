@@ -2,7 +2,7 @@
 //
 // 와탭 로그인(OAuth) 연결 흐름 테스트. 가짜 인가 서버와 가짜 argus 를 실제 HTTP 로
 // 띄우고, 봇의 /oauth/start → authorize → /oauth/callback → 토큰 저장 → argus
-// /v1/agent Bearer 호출까지 한 번에 지나간다.
+// front 의 /argus/v1/chat 호출까지 한 번에 지나간다.
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
@@ -216,12 +216,13 @@ async function startFakeAuthServer() {
   };
 }
 
-// ── 가짜 argus /v1/agent (JWKS 검증 대신 인가 서버가 발급한 access token 인지 본다) ──
+// ── 가짜 front 의 /argus (토큰을 확인하고 argus /v1/chat 으로 넘기는 자리. JWKS 검증 대신
+//    인가 서버가 발급한 access token 인지 본다). argus 는 토큰용 입구(/v1/agent)를 없앴다. ──
 
 async function startFakeArgus(isValidToken: (token: string) => boolean) {
   const requests: Array<{ headers: http.IncomingHttpHeaders; body: Record<string, unknown> }> = [];
   const srv = await listen(async (req, res) => {
-    if (req.method !== "POST" || req.url !== "/v1/agent") {
+    if (req.method !== "POST" || req.url !== "/v1/chat") {
       res.writeHead(404);
       return res.end();
     }
@@ -303,7 +304,7 @@ async function completeLogin(
 
 // ── 테스트 ──────────────────────────────────────────────────────
 
-test("login 링크 → 와탭 로그인 → 콜백 → 암호화 저장 → argus /v1/agent 를 그 사용자 Bearer 로 호출", async () => {
+test("login 링크 → 와탭 로그인 → 콜백 → 암호화 저장 → 질문을 그 사용자 토큰으로 front 의 /argus/v1/chat 에 보낸다", async () => {
   const as = await startFakeAuthServer();
   const argus = await startFakeArgus((t) => as.validAccess.has(t));
   const bot = await startBot(as.url);
@@ -343,7 +344,8 @@ test("login 링크 → 와탭 로그인 → 콜백 → 암호화 저장 → argu
     assert.ok(!raw.includes("at-2") && !raw.includes("rt-2"), "토큰은 암호화돼야 한다");
     assert.ok(!raw.includes("dev@example.com"), "이메일도 암호화돼야 한다");
 
-    // 4) 질문은 그 사용자 access token 으로 argus /v1/agent 에 간다 (cookie·X-Argus-Token 없음).
+    // 4) 질문은 그 사용자 access token 으로 front 의 /argus/v1/chat 에 간다 (cookie·X-Argus-Token 없음).
+    //    본문은 화면 채팅과 같은 모양이다 — argus 는 front 가 바꿔 준 세션만 보고, 토큰을 모른다.
     const token = await bot.manager.accessToken("T1", "U1");
     const steps: string[] = [];
     const answer = await askWhatapExpertDirect(
@@ -362,9 +364,9 @@ test("login 링크 → 와탭 로그인 → 콜백 → 암호화 저장 → argu
     assert.equal(sent.headers.cookie, undefined);
     assert.equal(sent.headers["x-argus-token"], undefined);
     assert.deepEqual(sent.body, {
-      query: "내 프로젝트 보여줘",
+      message: "내 프로젝트 보여줘",
       pcode: 38,
-      context: { source: "slack-bot" },
+      context: { client: "slack" },
     });
   } finally {
     await bot.cleanup();
@@ -435,9 +437,10 @@ test("refresh 가 invalid_grant 로 거절되면 연결을 지우고 다시 로�
     const later = new WhatapTokenManager(bot.store, bot.client, {
       now: () => Date.now() + 200_000,
     });
-    await assert.rejects(later.accessToken("T1", "U1"), LoginRequiredError);
+    await assert.rejects(later.accessToken("T1", "U1"), (err: unknown) => err instanceof LoginRequiredError && err.expired);
     assert.equal(bot.store.get("T1", "U1"), null);
-    await assert.rejects(later.accessToken("T1", "U1"), LoginRequiredError);
+    // 연결을 지운 뒤에는 "처음 연결"과 같다 — 만료라고 하지 않는다.
+    await assert.rejects(later.accessToken("T1", "U1"), (err: unknown) => err instanceof LoginRequiredError && !err.expired);
   } finally {
     await bot.cleanup();
     await as.close();
