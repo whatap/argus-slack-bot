@@ -99,6 +99,13 @@ export interface RunResult {
    * Slack 에서 클릭 불가 문제.
    */
   recommendedQuestions?: string[];
+  /**
+   * argus 가 render_options 로 보낸 선택지. 답변이 "버튼에서 고르세요" 라고 말하므로 호출자가 버튼으로
+   * 그린다. 누르면 value 가 같은 대화의 다음 메시지로 간다.
+   */
+  options?: Array<{ label: string; value: string }>;
+  /** 선택지가 답변 글보다 먼저 왔는지 (웹 화면처럼 글 위에 그릴지). */
+  optionsBeforeText?: boolean;
 }
 
 export interface ChipAction {

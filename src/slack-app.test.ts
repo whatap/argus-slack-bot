@@ -147,6 +147,29 @@ test("Socket remains the default, including existing local partial installer con
   assert.equal(options.token, "test-bot");
 });
 
+test("single-workspace Socket Mode serves its pages on the configured port, not Bolt's default 3000", { timeout: 5000 }, async (t) => {
+  // Bolt verifies a single-workspace token with auth.test as soon as the app is built; answer it locally.
+  let verified!: () => void;
+  const tokenChecked = new Promise<void>((resolve) => { verified = resolve; });
+  const slack = http.createServer(async (req, res) => {
+    for await (const _chunk of req) { /* drain */ }
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify({ ok: true, team_id: "T1", bot_id: "B1", user_id: "UBOT" }), verified);
+  });
+  await new Promise<void>((resolve) => slack.listen(0, "127.0.0.1", resolve));
+  t.after(() => { slack.closeAllConnections(); slack.close(); });
+  const settings = loadSlackSettings({ SLACK_APP_TOKEN: "test-app", SLACK_BOT_TOKEN: "test-bot", SLACK_OAUTH_PORT: "3010" });
+  assert.equal(settings.multiWorkspace, false);
+  const app = createSlackApp(settings, {
+    clientOptions: { slackApiUrl: `http://127.0.0.1:${(slack.address() as AddressInfo).port}/` },
+    customRoutes: [{ path: "/", method: ["GET"], handler: (_req, res) => { res.end(); } }],
+    logLevel: bolt.LogLevel.ERROR,
+  });
+  await tokenChecked;
+  // Bolt's Socket Mode receiver keeps the page server's port; two local bots cannot both take 3000.
+  assert.equal((app as unknown as { receiver: { httpServerPort?: number } }).receiver.httpServerPort, 3010);
+});
+
 test("both transports pass the event body to the custom error handler", () => {
   const socket = slackAppOptions(loadSlackSettings({ SLACK_APP_TOKEN: "test-app", SLACK_BOT_TOKEN: "test-bot" }));
   const http = slackAppOptions(loadSlackSettings(HTTP_ENV));

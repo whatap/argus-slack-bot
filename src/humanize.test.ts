@@ -24,14 +24,14 @@ test("argus 5xx → 일시 장애 안내", () => {
 });
 
 test("와탭 로그인 모드의 argus 401 → cookie 가 아니라 login 을 안내", () => {
-  const msg = humanizeError(new Error("argus /v1/agent error (401): "), { whatapLogin: true });
+  const msg = humanizeError(new Error("argus /v1/chat error (401): "), { whatapLogin: true });
   assert.match(msg, /401/);
   assert.match(msg, /`login`/);
   assert.doesNotMatch(msg, /cookie/);
 });
 
 test("와탭 로그인 모드의 argus 403 → 내 계정 권한 안내", () => {
-  const msg = humanizeError(new Error("argus /v1/agent error (403): forbidden"), { whatapLogin: true });
+  const msg = humanizeError(new Error("argus /v1/chat error (403): forbidden"), { whatapLogin: true });
   assert.match(msg, /권한/);
   assert.doesNotMatch(msg, /cookie/);
 });

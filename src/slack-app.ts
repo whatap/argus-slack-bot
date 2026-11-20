@@ -121,7 +121,9 @@ export function slackAppOptions(
       },
     } : { token: settings.botToken }),
     socketMode: settings.transport === "socket",
-    ...(settings.transport === "socket" ? { appToken: settings.appToken } : {
+    // Socket Mode 에서도 안내 페이지(customRoutes)용 HTTP 서버가 뜬다. 포트를 넘기지 않으면 Bolt 기본값 3000 에
+    // 묶여, 한 장비에서 두 번째 봇이 뜨지 못한다. (multi-workspace 는 위 installerOptions.port 가 우선한다.)
+    ...(settings.transport === "socket" ? { appToken: settings.appToken, port: settings.port } : {
       signingSecret: settings.signingSecret,
       endpoints: "/slack/events",
       port: settings.port,

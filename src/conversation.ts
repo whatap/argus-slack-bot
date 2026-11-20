@@ -26,6 +26,20 @@ export interface ThreadState {
   lastTouchedAt: number;
 }
 
+/**
+ * DM 본문(스레드 밖)의 대화 키. Slack 은 DM 본문 메시지마다 ts 가 달라서 `<channel>:<ts>` 로 키를 잡으면
+ * 메시지마다 새 대화가 된다 — 봇의 되물음에 짧게 답하면 앞 질문을 잊는다. DM 하나를 한 대화로 잇고,
+ * 끊는 것은 ThreadHistory 의 idle 만료가 한다.
+ */
+export function dmMainThreadKey(channel: string): string {
+  return `${channel}:dm`;
+}
+
+/** threadKey 가 DM 본문 대화인지. 다른 키는 `<channel>:<숫자 ts>` 라 겹치지 않는다. */
+export function isDmMainThreadKey(threadKey: string): boolean {
+  return threadKey.endsWith(":dm");
+}
+
 /** 자른 history 의 첫 메시지가 orphan 인지.
  *  user 메시지가 tool_result 만 들고 있으면 직전 assistant(tool_use) 가 사라진
  *  상태 → 다음 turn 호출 시 Anthropic 이 400 (`unexpected tool_use_id` 에러).
@@ -90,6 +104,10 @@ export class ThreadHistory {
       },
       setArgusConvId: (threadKey: string, id: string) => {
         if (isActive()) this.setArgusConvId(prefix + threadKey, id);
+      },
+      /** 이 대화를 잊는다 — argus 가 더는 모르는 대화 ID 를 계속 보내지 않게. */
+      reset: (threadKey: string) => {
+        if (isActive()) this.reset(prefix + threadKey);
       },
     };
   }
