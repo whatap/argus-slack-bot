@@ -13,6 +13,18 @@ test("public landing explains user OAuth, account creation and AI limitations in
   assert.doesNotMatch(html, /register &lt;token&gt;|14개|opus 4\.7|LLM 백엔드.*선택/);
 });
 
+test("public landing leads with alert triage, alert rule changes and remediation, each gated by a button press", () => {
+  const html = landingPageHtml();
+  for (const pillar of ["알림 확인", "알림 설정", "조치"]) assert.ok(html.includes(pillar), `핵심 기능 누락: ${pillar}`);
+  assert.match(html, /\[적용\]/);
+  assert.match(html, /조치 실행/);
+  assert.match(html, /버튼을 눌러야/);
+  // 서버 조치는 OPM 이 연결된 환경에서만 된다. 조건 없이 약속하지 않는다.
+  assert.match(html, /OPM/);
+  // 알림 채널 자동 대응은 설치만으로 켜지지 않는다(전용 앱·서버 설정). 문의 기능으로 적는다.
+  assert.match(html, /자동 대응[\s\S]*문의/);
+});
+
 test("public landing labels its sample conversation and ships no internal sample data or external assets", () => {
   const html = landingPageHtml();
   assert.ok(html.includes('href="/slack/install"'));
