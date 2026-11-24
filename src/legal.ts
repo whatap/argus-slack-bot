@@ -1,7 +1,7 @@
 // src/legal.ts
 //
 // Privacy Policy + Terms of Service 페이지 HTML — Slack App Directory submit
-// 시 필수. landing.ts 와 동일 스타일 시스템 (navy / accent) 재사용.
+// 시 필수. landing.ts 와 같은 흰 바탕·파랑 링크 색을 쓴다.
 // 시연/PoC 단계의 합리적 minimum draft — 정식 출시 전 법무 검토 권장.
 
 const LAST_UPDATED = "2026-11-03";
@@ -17,35 +17,36 @@ function legalShell(title: string, body: string): string {
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
-      --navy: #0a1628;
-      --navy-2: #122236;
-      --accent: #4f9cf9;
-      --text: #e6edf3;
-      --text-dim: #8b95a3;
-      --border: #1e2d44;
+      --bg: #ffffff;
+      --surface: #f6f8fc;
+      --link: #296cf2;
+      --ink: #0f172a;
+      --ink-2: #3b4557;
+      --muted: #667085;
+      --line: #e6e9f0;
     }
     html, body {
-      background: var(--navy);
-      color: var(--text);
+      background: var(--bg);
+      color: var(--ink);
       font-family: -apple-system, BlinkMacSystemFont, "SF Pro KR", "Apple SD Gothic Neo",
                    "Pretendard", "Noto Sans KR", sans-serif;
       line-height: 1.7;
       word-break: keep-all;
       -webkit-font-smoothing: antialiased;
     }
-    a { color: var(--accent); text-decoration: none; }
+    a { color: var(--link); text-decoration: none; }
     a:hover { text-decoration: underline; }
     .container { max-width: 800px; margin: 0 auto; padding: 64px 24px 96px; }
-    header { border-bottom: 1px solid var(--border); padding-bottom: 24px; margin-bottom: 40px; }
+    header { border-bottom: 1px solid var(--line); padding-bottom: 24px; margin-bottom: 40px; }
     h1 { font-size: 36px; font-weight: 800; letter-spacing: -0.8px; margin-bottom: 8px; }
-    .last-updated { font-size: 13px; color: var(--text-dim); }
+    .last-updated { font-size: 13px; color: var(--muted); }
     h2 { font-size: 22px; font-weight: 700; margin: 40px 0 12px; letter-spacing: -0.3px; }
     h3 { font-size: 17px; font-weight: 600; margin: 24px 0 8px; }
-    p { font-size: 15px; color: var(--text); margin-bottom: 12px; }
+    p { font-size: 15px; color: var(--ink-2); margin-bottom: 12px; }
     ul { margin: 8px 0 16px 24px; }
-    li { font-size: 15px; color: var(--text); margin-bottom: 6px; }
-    code { background: var(--navy-2); border: 1px solid var(--border); padding: 1px 6px; border-radius: 4px; font-size: 13px; }
-    .footer { margin-top: 64px; padding-top: 24px; border-top: 1px solid var(--border); font-size: 13px; color: var(--text-dim); }
+    li { font-size: 15px; color: var(--ink-2); margin-bottom: 6px; }
+    code { background: var(--surface); border: 1px solid var(--line); padding: 1px 6px; border-radius: 4px; font-size: 13px; }
+    .footer { margin-top: 64px; padding-top: 24px; border-top: 1px solid var(--line); font-size: 13px; color: var(--muted); }
     .footer a { margin-right: 16px; }
   </style>
 </head>
