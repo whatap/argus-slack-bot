@@ -47,7 +47,7 @@ CI(`ci.yml`)는 PR 마다 두 아키텍처 묶음을 만들어 ubuntu 22.04 컨�
    - 값은 영문·숫자와 `+ / = _ . ~ -` 만 쓴다. 다른 키가 섞이거나 하나라도 비면 서비스가 시작하지 않는다 (`deploy/secrets-to-env.mjs`).
 5. S3 경로 두 개 (같은 버킷이어도 된다)
    - 배포 묶음 `S3_PREFIX`
-   - 백업 `BACKUP_S3_URI`: 접근은 운영 계정만, 보관 기간은 lifecycle 로. 사본의 토큰은 암호화된 그대로지만 대화 기록은 평문이다. 대화 기록은 봇이 오래 두지 않는다: 마지막 활동 후 30분이 지난 스레드는 다음 요청 때 지우고, 스레드마다 최근 메시지 40개(`MAX_HISTORY_TURNS` 10 × 4)까지만 남긴다 (`src/conversation.ts`).
+   - 백업 `BACKUP_S3_URI`: 접근은 운영 계정만, 보관 기간은 lifecycle 로. 설치·사용자 토큰 DB만 백업하며 토큰은 암호화된 그대로다. 평문 대화 기록(`thread_history`)은 서버 백업과 S3 업로드에서 제외한다. 실행 중인 봇의 대화 기록 보관 정책은 바꾸지 않는다: 마지막 활동 후 30분이 지난 스레드는 다음 요청 때 지우고, 스레드마다 최근 메시지 40개(`MAX_HISTORY_TURNS` 10 × 4)까지만 남긴다 (`src/conversation.ts`).
 6. IAM 역할 두 개
    - GitHub 배포 역할(`AWS_ROLE_ARN`)
      - trust: `token.actions.githubusercontent.com`, `aud = sts.amazonaws.com`, `sub = repo:whatap/argus-slack-bot:environment:production`
@@ -70,9 +70,10 @@ CI(`ci.yml`)는 PR 마다 두 아키텍처 묶음을 만들어 ubuntu 22.04 컨�
 디렉터리, `conf/config.env`, systemd unit 은 DevOps 가 서버 규칙대로 둔다 (whatap 소유, 운영 Argus 와 같다).
 
 - `/data/whatap/plugin/argus-slack-bot/conf/config.env`: `deploy/config.env.example` 을 채운다. 비밀값은 넣지 않는다.
-- systemd unit 3개(`argus-slack-bot.service`, `argus-slack-bot-backup.service`·`.timer`): `deploy/systemd/` 를 참고해 설치·활성화한다. `User=whatap` 과 샌드박스 설정(`NoNewPrivileges`, `ProtectSystem=strict`, `ReadWritePaths` 는 `data/`·`backups/` 만)은 그대로 둔다.
+- systemd 서비스 unit 1개(`argus-slack-bot.service`): `deploy/systemd/` 를 참고해 설치·활성화한다. `User=whatap` 과 샌드박스 설정(`NoNewPrivileges`, `ProtectSystem=strict`, `ReadWritePaths` 는 `data/`·`backups/` 만)은 그대로 둔다.
+- 백업은 Jenkins 잡이 매일 00:05 KST에 `current/deploy/backup.sh`를 직접 실행한다. 서비스 계정으로 실행하고 `conf/config.env`의 백업 설정을 환경변수로 전달한다. 실패는 Jenkins에서 확인한다. 기존 백업 service·timer 참고 파일은 운영 서버에 설치·활성화하지 않는다.
 
-배포는 소유·권한을 검사하지 않고 unit 도 설치·교체하지 않는다. 디렉터리와 설정 파일의 소유·권한은 서버 규칙을 따르고, 앱이 침해됐을 때 `conf/`·`releases/` 를 바꾸지 못하게 막는 것은 unit 의 샌드박스다. 서비스 unit 이 없으면 배포·되돌리기가 S3 를 부르기 전에 `UNIT-MISSING` 으로 멈춘다. `releases/`, `data/`, `backups/` 는 없으면 첫 배포가 만든다. unit 을 바꿔야 하면(실행 옵션, 설정 파일 위치) DevOps 에 요청한다.
+배포는 기존 디렉터리·설정 파일의 소유·권한을 검사하지 않고 unit 도 설치·교체하지 않는다. 새로 푼 판의 파일은 `SERVICE_USER` 소유로 맞추고, 배포·되돌리기 때 `current` 링크 자체도 같은 소유자로 맞춘다. `history`는 root 소유로 두며 변경하지 않는다. 앱이 침해됐을 때 `conf/`·`releases/` 를 바꾸지 못하게 막는 것은 unit 의 샌드박스다. 서비스 unit 이 없으면 배포·되돌리기가 S3 를 부르기 전에 `UNIT-MISSING` 으로 멈춘다. `releases/`, `data/`, `backups/` 는 없으면 첫 배포가 만든다. unit 을 바꿔야 하면(실행 옵션, 설정 파일 위치) DevOps 에 요청한다.
 
 ## 배포·상태·되돌리기
 
@@ -85,8 +86,8 @@ gh workflow run deploy-prod.yml --ref main -f action=rollback
 deploy 순서:
 1. 테스트·타입·빌드 → arm64·x64 묶음 → 컨테이너 실행 확인
 2. 서버 상태 읽기(아키텍처 확인) → 맞는 묶음을 S3 로
-3. 서버(root): config.env·서비스 계정·서비스 unit 확인 → sha256 대조 → `releases/<UTC시각>-<커밋>` 에 풀기 → 묶음 검사(.env 없음, 아키텍처, 서비스 계정으로 Node 22·better-sqlite3 로드). 묶음의 앱 코드(node)는 root 로 실행하지 않는다. 중단된 배포가 남긴 `*.partial` 은 이때 지운다.
-4. `current` 교체 → 재시작 → 헬스체크(3000 `/` 200, 3901 `/oauth/callback` 400, 최대 60초)
+3. 서버(root): config.env·서비스 계정·서비스 unit 확인 → sha256 대조 → `releases/<UTC시각>-<커밋>` 에 풀기 → 묶음 검사(.env 없음, 아키텍처) → 해당 판을 `chown -R "$SERVICE_USER:$SERVICE_USER"` → 서비스 계정으로 Node 22·better-sqlite3 로드 확인. 묶음의 앱 코드(node)는 root 로 실행하지 않는다. 중단된 배포가 남긴 `*.partial` 은 이때 지운다.
+4. `current` 교체 → `chown -h`로 링크 자체의 소유자 변경 → 재시작 → 헬스체크(3000 `/` 200, 3901 `/oauth/callback` 400, 최대 60초)
 5. 실패하면 직전 판으로 되돌린다. 직전 판이 헬스체크를 넘을 때만 실패한 판을 지우고, 아니면 둘 다 남긴다. Actions 로그에 재시작마다 그 이후의 서비스 로그를 30줄까지 싣는다(되돌리기까지 실패하면 두 번). 워크플로는 실패로 끝난다.
 6. 첫 배포라 되돌릴 판이 없으면(`FIRST-DEPLOY-FAILED`) 서비스는 그 판으로 계속 다시 시작한다. config.env·비밀을 고치면 뜨므로 `action=status` 로 확인한다.
 
@@ -102,11 +103,11 @@ rollback 은 `history` 기준으로 지금 판 직전에 돌던 판으로 바꾼
 /run/argus-slack-bot/secrets.env         시작할 때 서비스 계정이 Secrets Manager 에서 만든다 (whatap 0600). 메모리(tmpfs)라 디스크·스냅샷에 남지 않고, 서비스가 멈추면 지워진다
 /data/whatap/plugin/argus-slack-bot/     whatap 소유 (서버 규칙, 운영 Argus 와 같다)
   conf/config.env                        비밀이 아닌 설정 (conf/ 0750). 배포가 바꾸지 않는다
-  releases/<UTC시각>-<커밋>/              배포(root)가 푼다. group·other 쓰기 없음
-  current -> releases/...
+  releases/<UTC시각>-<커밋>/              배포(root)가 푼 뒤 whatap 소유로 맞춘다. group·other 쓰기 없음
+  current -> releases/...                 링크 자체도 whatap 소유
   data/                                  SQLite (whatap 0700)
   backups/                               백업 (whatap 0700)
-  history                                current 가 된 판 기록
+  history                                current 가 된 판 기록 (root 소유 유지)
 ```
 
 ## 비밀값
@@ -118,10 +119,12 @@ rollback 은 `history` 기준으로 지금 판 직전에 돌던 판으로 바꾼
 
 ## 백업·복구
 
-- 매일 03:30(서버 시각, 최대 15분 지연): SQLite 3개를 온라인 백업해 `backups/<UTC시각>/` 에 두고(서버에 7개) `BACKUP_S3_URI` 로 올린다. 사본마다 `integrity_check` 를 본다.
-- config.env 의 `SLACK_INSTALLATIONS_DB`, `SLACK_USER_TOKENS_DB`, `SLACK_THREAD_HISTORY_DB` 는 필수다. DB 가 하나라도 없으면 백업은 실패로 끝나고 S3 업로드와 오래된 백업 정리를 하지 않는다. 이전 백업은 그대로 남는다.
-- 지금 바로: `sudo systemctl start argus-slack-bot-backup`
-- 복구: `sudo systemctl stop argus-slack-bot` → `data/` 의 파일을 백업본으로 바꾸고(소유자 `whatap`, 권한 0600 유지) 같은 이름의 `-wal`·`-shm` 을 지운다 → `sudo systemctl start argus-slack-bot`
+- Jenkins 잡이 매일 00:05 KST에 설치·사용자 토큰 SQLite 2개를 온라인 백업해 `backups/<UTC시각>/` 에 두고(서버에 7개) `BACKUP_S3_URI` 로 올린다. 사본마다 `integrity_check` 를 본다.
+- 백업에 필요한 config.env 값은 `SLACK_INSTALLATIONS_DB`, `SLACK_USER_TOKENS_DB`다. 둘 중 하나라도 없으면 실패로 끝나고 S3 업로드와 오래된 백업 정리를 하지 않는다. 이전 백업은 그대로 남는다. `SLACK_THREAD_HISTORY_DB`의 설정·파일 유무는 백업 조건이 아니다.
+- 지금 바로 실행할 때도 Jenkins 백업 잡을 사용한다. 서버의 백업 service·timer는 사용하지 않는다.
+- 같은 시각의 백업 디렉터리가 이미 있으면 재사용하지 않고 실패한다. 옛 디렉터리에 남은 대화 기록이 새 업로드에 섞이는 것을 막는다.
+- 복구: `sudo systemctl stop argus-slack-bot` → 설치·사용자 토큰 DB만 백업본으로 바꾸고(소유자 `whatap`, 권한 0600 유지) 교체한 DB와 같은 이름의 `-wal`·`-shm` 을 지운다 → `sudo systemctl start argus-slack-bot`. 대화 기록은 복구 대상이 아니다.
+- 전환 전에 생성한 대화 기록 포함 백업은 이 스크립트가 소급 삭제하지 않는다. 새 백업의 내용 확인 후 기존 서버·S3 백업 정리는 DevOps가 별도로 진행한다.
 
 ## 확인 기준
 

@@ -217,6 +217,9 @@ make_bundle r01
 deploy r01
 check "배포 성공 표식" '[ "$RC" -eq 0 ] && grep -q "^DEPLOY-OK release=r01" "$T/out.log"'
 check "current → r01" '[ "$(current)" = r01 ]'
+check "배포 파일은 서비스 계정 소유로 맞춤" 'grep -qxF "chown -R whatap:whatap $T/app/releases/r01" "$T/calls.log"'
+check "current 링크 자체를 서비스 계정 소유로 맞춤" 'grep -qxF "chown -h whatap:whatap $T/app/current" "$T/calls.log"'
+check "배포 이력 history의 소유자는 바꾸지 않음" '! grep -E "^chown .* $T/app/history$" "$T/calls.log"'
 # 서버 디렉터리·설정은 whatap 소유가 규칙이다 (시험에서는 이 시험을 돌리는 계정 소유)
 check "APP_ROOT·conf/·config.env 가 root 소유가 아니어도 배포" '[ "$RC" -eq 0 ] && { [ "$(id -u)" = 0 ] || [ "$(owner_uid "$T/app/conf/config.env")" != 0 ]; }'
 check "배포는 unit 을 설치·활성화하지 않는다 (서버에 DevOps 가 둔다)" '[ -z "$(ls -A "$T/units")" ] && ! grep -Eq "^systemctl (enable|daemon-reload)" "$T/calls.log"'
@@ -275,8 +278,10 @@ run deploy --bucket b --key "r08.tar.gz" --sha256 "$(sha "$T/s3/r02.tar.gz")" --
 check "release 이름 형식 검사" '[ "$RC" -ne 0 ] && [ "$(current)" = r02 ]'
 
 # rollback = 지금 판 직전에 돌던 판으로
+: > "$T/calls.log"
 run rollback
 check "rollback → r01" '[ "$RC" -eq 0 ] && grep -q "^ROLLBACK-OK release=r01" "$T/out.log" && [ "$(current)" = r01 ]'
+check "rollback도 current 링크 자체의 소유자를 맞춤" 'grep -qxF "chown -h whatap:whatap $T/app/current" "$T/calls.log"'
 run rollback
 check "rollback 한 번 더 → r02 (직전 판)" '[ "$RC" -eq 0 ] && [ "$(current)" = r02 ]'
 touch "$T/state/bad-r01"
