@@ -20,7 +20,7 @@ set -euo pipefail
 umask 022
 
 APP_ROOT=${APP_ROOT:-/data/whatap/plugin/argus-slack-bot}
-# 비밀이 아닌 운영 설정. unit 2개의 EnvironmentFile= 과 같은 곳이어야 한다 (배포가 바꾸지 않는다)
+# 비밀이 아닌 운영 설정. 서비스 unit 의 EnvironmentFile= 과 같은 곳이어야 한다 (배포가 바꾸지 않는다)
 CONFIG_FILE=${CONFIG_FILE:-$APP_ROOT/conf/config.env}
 SERVICE_USER=${SERVICE_USER:-whatap}
 KEEP_RELEASES=${KEEP_RELEASES:-5}
@@ -70,7 +70,10 @@ previous_release() {  # <current> — history 에서 current 직전에 돌던 �
 
 record() { echo "$1" >> "$HISTORY"; }
 
-switch_to() { ln -sfn "releases/$1" "$APP_ROOT/current"; }
+switch_to() {
+  ln -sfn "releases/$1" "$APP_ROOT/current"
+  chown -h "$SERVICE_USER:$SERVICE_USER" "$APP_ROOT/current"
+}
 
 http_code() { curl -s -o /dev/null -m 5 -w '%{http_code}' "http://127.0.0.1:$1$2" || true; }
 
@@ -121,7 +124,7 @@ check_bundle() {  # <풀어 놓은 디렉터리>
   [ -x "$d/node/bin/node" ] || { say "node/bin/node 없음"; return 1; }
   [ -f "$d/dist/index.js" ] || { say "dist/index.js 없음"; return 1; }
   [ -f "$d/BUILD-INFO" ] || { say "BUILD-INFO 없음"; return 1; }
-  # systemd 가 바로 실행하는 파일 (ExecStartPre, 백업 ExecStart)
+  # 서비스와 Jenkins 백업 잡이 바로 실행하는 파일
   [ -x "$d/deploy/load-secrets.sh" ] && [ -x "$d/deploy/backup.sh" ] || { say "deploy/*.sh 실행 권한 없음"; return 1; }
   # 봇은 dotenv override 로 작업 디렉터리의 .env 를 환경변수보다 우선한다 — 운영 설정을 덮지 않게 막는다
   if [ -e "$d/.env" ]; then say "묶음에 .env 가 있어요"; return 1; fi
@@ -190,6 +193,7 @@ cmd_deploy() {
   fi
   chmod -R a+rX,go-w "$stage"
   mv "$stage" "$dest"
+  chown -R "$SERVICE_USER:$SERVICE_USER" "$dest"
   if ! smoke_release "$dest"; then
     rm -rf "$dest"
     fail DEPLOY-FAILED "SMOKE-FAIL $release"

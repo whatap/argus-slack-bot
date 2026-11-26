@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# deploy/backup.sh 시험 — systemd 처럼 current 심볼릭 링크 경로로 실행하고, SQLite 3개는 node + better-sqlite3 로 실제로 만든다.
-# PATH 앞에 가짜 aws 를 둔다 (S3 업로드는 호출만 기록한다).
+# deploy/backup.sh 시험 — Jenkins 처럼 current 심볼릭 링크 경로로 실행하고, SQLite 3개는 node + better-sqlite3 로 실제로 만든다.
+# PATH 앞에 가짜 aws 를 둔다 (업로드 호출과 전달할 사본을 로컬에서 검증한다).
 #   bash deploy/test/backup.test.sh
 # macOS 기본 bash(3.2)와 리눅스 bash 에서 모두 돈다.
 # check 의 조건식은 eval 로 나중에 펼치므로 일부러 작은따옴표로 쓴다.
@@ -30,7 +30,8 @@ check() {  # <이름> <조건식>
 A="$T/app"
 R="$A/releases/r1"
 mkdir -p "$R/deploy" "$R/node/bin" "$A/data" "$T/bin"
-cp "$HERE/../backup.sh" "$HERE/../backup-db.mjs" "$R/deploy/"
+cp "${ASB_BACKUP_SCRIPT:-$HERE/../backup.sh}" "$R/deploy/backup.sh"
+cp "$HERE/../backup-db.mjs" "$R/deploy/"
 chmod 0755 "$R/deploy/backup.sh"
 ln -s "$NODE" "$R/node/bin/node"
 ln -s "$NODE_MODULES" "$R/node_modules"
@@ -47,8 +48,16 @@ for (const p of process.argv.slice(1)) {
 cat > "$T/bin/aws" <<'EOF'
 #!/usr/bin/env bash
 echo "aws $*" >> "$ASB_T/calls.log"
+if [ "$1" = s3 ] && [ "$2" = cp ]; then
+  cp -R "$5" "$ASB_T/uploaded"
+fi
 EOF
 chmod +x "$T/bin/aws"
+cat > "$T/bin/date" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' 20261126T000000Z
+EOF
+chmod +x "$T/bin/date"
 
 OLD="20200101T000000Z 20200102T000000Z 20200103T000000Z 20200104T000000Z"
 reset_backups() {  # 이전 실행이 남긴 서버 백업 4개
@@ -65,6 +74,11 @@ count() { find "$2" -mindepth 1 -maxdepth 1 -type "$1" | wc -l | tr -d ' '; }
 
 run() {  # [env 인자…] → 출력 $T/out.log, 종료 코드 $RC. 기본 설정은 DB 3개가 다 있고 KEEP_LOCAL_BACKUPS=3
   reset_backups
+  rm -rf "$T/uploaded"
+  if [ -n "${COLLISION:-}" ]; then
+    mkdir -p "$A/backups/20261126T000000Z"
+    cp "$A/data/thread_history.sqlite" "$A/backups/20261126T000000Z/"
+  fi
   : > "$T/calls.log"
   set +e
   (
@@ -81,11 +95,11 @@ run() {  # [env 인자…] → 출력 $T/out.log, 종료 코드 $RC. 기본 설�
 run
 NEW=$(newest)
 check "DB 3개 → 종료 코드 0" '[ "$RC" -eq 0 ]'
-check "새 백업에 사본 3개" 'case "$NEW" in ""|2020*) false ;; esac && [ "$(count f "$A/backups/$NEW")" = 3 ] && [ -f "$A/backups/$NEW/installations.sqlite" ] && [ -f "$A/backups/$NEW/user_tokens.sqlite" ] && [ -f "$A/backups/$NEW/thread_history.sqlite" ]'
+check "새 백업은 설치·사용자 토큰 DB만 포함 (대화 기록 제외)" 'case "$NEW" in ""|2020*) false ;; esac && [ "$(count f "$A/backups/$NEW")" = 2 ] && [ -f "$A/backups/$NEW/installations.sqlite" ] && [ -f "$A/backups/$NEW/user_tokens.sqlite" ] && [ ! -e "$A/backups/$NEW/thread_history.sqlite" ]'
 check "서버 백업은 KEEP_LOCAL_BACKUPS(3)개만 남김" '[ "$(count d "$A/backups")" = 3 ] && [ -d "$A/backups/20200104T000000Z" ] && [ -d "$A/backups/20200103T000000Z" ]'
 check "BACKUP_S3_URI 가 없으면 올리지 않음" '! grep -q "^aws " "$T/calls.log"'
 
-run SLACK_THREAD_HISTORY_DB="$A/data/missing.sqlite" BACKUP_S3_URI=s3://asb-test-bucket/backups
+run SLACK_USER_TOKENS_DB="$A/data/missing.sqlite" BACKUP_S3_URI=s3://asb-test-bucket/backups
 check "DB 하나가 없으면 → 실패" '[ "$RC" -ne 0 ]'
 check "DB 하나가 없으면 → 오래된 백업을 지우지 않음" 'old_untouched'
 check "DB 하나가 없으면 → S3 로 올리지 않음" '! grep -q "^aws s3 cp" "$T/calls.log"'
@@ -98,6 +112,18 @@ run BACKUP_S3_URI=s3://asb-test-bucket/backups/
 NEW=$(newest)
 check "BACKUP_S3_URI → 종료 코드 0" '[ "$RC" -eq 0 ]'
 check "BACKUP_S3_URI 로 새 백업을 통째로 올림" 'grep -qxF "aws s3 cp --recursive --only-show-errors $A/backups/$NEW s3://asb-test-bucket/backups/$NEW/ --region ap-northeast-2" "$T/calls.log"'
+check "업로드할 내용은 필수 DB 2개뿐이며 대화 기록은 없음" '[ "$(count f "$T/uploaded")" = 2 ] && [ -f "$T/uploaded/installations.sqlite" ] && [ -f "$T/uploaded/user_tokens.sqlite" ] && [ ! -e "$T/uploaded/thread_history.sqlite" ]'
+
+run -u SLACK_THREAD_HISTORY_DB BACKUP_S3_URI=s3://asb-test-bucket/backups
+check "대화 기록 설정이 없어도 필수 DB 2개 백업·업로드 성공" '[ "$RC" -eq 0 ] && [ "$(count f "$T/uploaded")" = 2 ]'
+run SLACK_THREAD_HISTORY_DB="$A/data/missing.sqlite" BACKUP_S3_URI=s3://asb-test-bucket/backups
+check "대화 기록 파일이 없어도 백업 성공" '[ "$RC" -eq 0 ] && [ "$(count f "$T/uploaded")" = 2 ]'
+
+run SLACK_INSTALLATIONS_DB="$A/data/missing.sqlite" BACKUP_S3_URI=s3://asb-test-bucket/backups
+check "설치 DB가 없으면 업로드·정리 금지" '[ "$RC" -ne 0 ] && old_untouched && [ ! -e "$T/uploaded" ]'
+
+COLLISION=1 run BACKUP_S3_URI=s3://asb-test-bucket/backups
+check "같은 시각의 옛 백업 디렉터리는 재사용·업로드하지 않음" '[ "$RC" -ne 0 ] && old_untouched && [ ! -e "$T/uploaded" ] && [ -f "$A/backups/20261126T000000Z/thread_history.sqlite" ]'
 
 echo "# pass=$PASSES fail=$FAILS"
 [ "$FAILS" -eq 0 ]
