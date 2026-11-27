@@ -73,7 +73,7 @@ CI(`ci.yml`)는 PR 마다 두 아키텍처 묶음을 만들어 ubuntu 22.04 컨�
 - systemd 서비스 unit 1개(`argus-slack-bot.service`): `deploy/systemd/` 를 참고해 설치·활성화한다. `User=whatap` 과 샌드박스 설정(`NoNewPrivileges`, `ProtectSystem=strict`, `ReadWritePaths` 는 `data/`·`backups/` 만)은 그대로 둔다.
 - 백업은 Jenkins 잡이 매일 00:05 KST에 `current/deploy/backup.sh`를 직접 실행한다. 서비스 계정으로 실행하고 `conf/config.env`의 백업 설정을 환경변수로 전달한다. 실패는 Jenkins에서 확인한다. 기존 백업 service·timer 참고 파일은 운영 서버에 설치·활성화하지 않는다.
 
-배포는 기존 디렉터리·설정 파일의 소유·권한을 검사하지 않고 unit 도 설치·교체하지 않는다. 새로 푼 판의 파일은 `SERVICE_USER` 소유로 맞추고, 배포·되돌리기 때 `current` 링크 자체도 같은 소유자로 맞춘다. `history`는 root 소유로 두며 변경하지 않는다. 앱이 침해됐을 때 `conf/`·`releases/` 를 바꾸지 못하게 막는 것은 unit 의 샌드박스다. 서비스 unit 이 없으면 배포·되돌리기가 S3 를 부르기 전에 `UNIT-MISSING` 으로 멈춘다. `releases/`, `data/`, `backups/` 는 없으면 첫 배포가 만든다. unit 을 바꿔야 하면(실행 옵션, 설정 파일 위치) DevOps 에 요청한다.
+배포는 기존 디렉터리·설정 파일의 소유·권한을 검사하지 않고 unit 도 설치·교체하지 않는다. 새로 푼 판의 파일은 `SERVICE_USER` 소유로 맞추고, 배포·되돌리기 때 `current` 링크 자체와 `history`(기록을 남긴 뒤)도 같은 소유자로 맞춘다. 앱이 침해됐을 때 `conf/`·`releases/`·`history` 를 바꾸지 못하게 막는 것은 unit 의 샌드박스다. 서비스 unit 이 없으면 배포·되돌리기가 S3 를 부르기 전에 `UNIT-MISSING` 으로 멈춘다. `releases/`, `data/`, `backups/` 는 없으면 첫 배포가 만든다. unit 을 바꿔야 하면(실행 옵션, 설정 파일 위치) DevOps 에 요청한다.
 
 ## 배포·상태·되돌리기
 
@@ -87,7 +87,7 @@ deploy 순서:
 1. 테스트·타입·빌드 → arm64·x64 묶음 → 컨테이너 실행 확인
 2. 서버 상태 읽기(아키텍처 확인) → 맞는 묶음을 S3 로
 3. 서버(root): config.env·서비스 계정·서비스 unit 확인 → sha256 대조 → `releases/<UTC시각>-<커밋>` 에 풀기 → 묶음 검사(.env 없음, 아키텍처) → 해당 판을 `chown -R "$SERVICE_USER:$SERVICE_USER"` → 서비스 계정으로 Node 22·better-sqlite3 로드 확인. 묶음의 앱 코드(node)는 root 로 실행하지 않는다. 중단된 배포가 남긴 `*.partial` 은 이때 지운다.
-4. `current` 교체 → `chown -h`로 링크 자체의 소유자 변경 → 재시작 → 헬스체크(3000 `/` 200, 3901 `/oauth/callback` 400, 최대 60초)
+4. `current` 교체 → `chown -h`로 링크 자체의 소유자 변경 → 재시작 → 헬스체크(3000 `/` 200, 3901 `/oauth/callback` 400, 최대 60초) → 넘으면 `history` 에 기록하고 `chown "$SERVICE_USER:$SERVICE_USER"`
 5. 실패하면 직전 판으로 되돌린다. 직전 판이 헬스체크를 넘을 때만 실패한 판을 지우고, 아니면 둘 다 남긴다. Actions 로그에 재시작마다 그 이후의 서비스 로그를 30줄까지 싣는다(되돌리기까지 실패하면 두 번). 워크플로는 실패로 끝난다.
 6. 첫 배포라 되돌릴 판이 없으면(`FIRST-DEPLOY-FAILED`) 서비스는 그 판으로 계속 다시 시작한다. config.env·비밀을 고치면 뜨므로 `action=status` 로 확인한다.
 
@@ -107,7 +107,7 @@ rollback 은 `history` 기준으로 지금 판 직전에 돌던 판으로 바꾼
   current -> releases/...                 링크 자체도 whatap 소유
   data/                                  SQLite (whatap 0700)
   backups/                               백업 (whatap 0700)
-  history                                current 가 된 판 기록 (root 소유 유지)
+  history                                current 가 된 판 기록. 배포(root)가 기록한 뒤 whatap 소유로 맞춘다
 ```
 
 ## 비밀값

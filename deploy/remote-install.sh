@@ -68,7 +68,11 @@ previous_release() {  # <current> — history 에서 current 직전에 돌던 �
   if [ "$last" = "$1" ] && [ -n "$before" ] && [ -d "$RELEASES/$before" ]; then echo "$before"; fi
 }
 
-record() { echo "$1" >> "$HISTORY"; }
+# history 도 배포 파일처럼 서비스 계정 소유로 맞춘다 (DEVOPS-6837)
+record() {
+  echo "$1" >> "$HISTORY"
+  chown "$SERVICE_USER:$SERVICE_USER" "$HISTORY"
+}
 
 switch_to() {
   ln -sfn "releases/$1" "$APP_ROOT/current"
