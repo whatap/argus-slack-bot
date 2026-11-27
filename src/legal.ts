@@ -4,8 +4,8 @@
 // 시 필수. landing.ts 와 같은 흰 바탕·파랑 링크 색을 쓴다.
 // 시연/PoC 단계의 합리적 minimum draft — 정식 출시 전 법무 검토 권장.
 
-const LAST_UPDATED = "2026-11-03";
-const SUPPORT_EMAIL = "jykim@whatap.io";
+const LAST_UPDATED = "2026-11-27";
+const SUPPORT_EMAIL = "support@whatap.io";
 
 function legalShell(title: string, body: string): string {
   return `<!DOCTYPE html>
@@ -75,13 +75,12 @@ export function supportPageHtml(): string {
     <h2>처음 사용하기</h2>
     <p>봇 DM 에서 <code>login</code> 을 보내고 브라우저에서 와탭 계정을 연결하세요. 계정이 없으면 <a href="https://service.whatap.io">와탭 콘솔</a> 에서 가입하거나 조직 관리자에게 초대와 프로젝트 접근 권한을 요청하세요.</p>
     <p><code>whoami</code> 는 연결 계정 확인, <code>logout</code> 은 연결 해제, <code>help</code> 는 사용법 안내입니다.</p>
-    <p><strong>운영 공개 전 검토 초안:</strong> 팀 지원 연락처와 응답 담당·처리 기준은 공개 전에 확정해야 합니다.</p>
   `);
 }
 
 export function privacyPageHtml(): string {
   const body = `
-    <p><strong>운영 공개 전 검토 초안:</strong> 아래는 와탭 OAuth 모드의 코드상 처리 방식입니다. 운영 LLM 제공자·모델·저장 지역·보관 기간과 지원 창구를 확정하고 검토한 뒤 공개해야 합니다.</p>
+    <p><strong>운영 공개 전 검토 초안:</strong> 아래는 와탭 OAuth 모드의 코드상 처리 방식입니다. 운영 LLM 제공자·모델·저장 지역·보관 기간을 확정하고 검토한 뒤 공개해야 합니다.</p>
     <p><strong>WhaTap Argus Slack App</strong> ("서비스") 는 WhaTap Labs Inc. 가 제공하는 Slack 봇 통합입니다. 본 정책은 사용자가 본 서비스를 사용할 때 수집·처리되는 데이터를 설명합니다.</p>
 
     <h2>1. 수집 데이터</h2>
