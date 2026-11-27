@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { landingPageHtml } from "./landing.js";
-import { privacyPageHtml, termsPageHtml } from "./legal.js";
+import { privacyPageHtml, supportPageHtml, termsPageHtml } from "./legal.js";
 
 test("public landing explains user OAuth, account creation and AI limitations instead of token pasting", () => {
   const html = landingPageHtml();
@@ -42,4 +42,20 @@ test("privacy draft documents OAuth tokens and separates local deletion from ups
   assert.match(html, /Argus.*보관/);
   assert.doesNotMatch(html, /register &lt;token&gt;|cookie &lt;JSESSIONID/);
   assert.match(termsPageHtml(), /정확성/);
+});
+
+test("support page gives the company support address and carries no draft notice", () => {
+  const html = supportPageHtml();
+  assert.ok(html.includes('href="mailto:support@whatap.io"'));
+  assert.match(html, /별도 계정을 만들 필요/);
+  assert.doesNotMatch(html, /초안|확정해야/);
+});
+
+test("public legal pages list only the company support address, never a personal one", () => {
+  for (const html of [supportPageHtml(), privacyPageHtml(), termsPageHtml()]) {
+    const addresses = [...new Set(html.match(/[a-z0-9._+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi) ?? [])];
+    assert.deepEqual(addresses, ["support@whatap.io"]);
+  }
+  // 지원 창구는 정해졌다. 개인정보처리방침 초안 안내에는 아직 정해지지 않은 항목만 남긴다.
+  assert.doesNotMatch(privacyPageHtml(), /지원 창구를 확정/);
 });
