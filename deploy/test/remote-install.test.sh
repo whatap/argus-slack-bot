@@ -123,9 +123,16 @@ if [ "${1:-}" = -u ] && [ "${2:-}" = whatap ]; then echo 1000; exit 0; fi
 exit 1
 EOF
 
-  for c in chown journalctl; do
-    printf '#!/usr/bin/env bash\necho "%s $*" >> "$ASB_T/calls.log"\n' "$c" > "$T/bin/$c"
-  done
+  printf '#!/usr/bin/env bash\necho "journalctl $*" >> "$ASB_T/calls.log"\n' > "$T/bin/journalctl"
+  # history 는 기록을 남긴 뒤 소유자를 맞추는지 보려고, chown 할 때 history 의 마지막 줄도 남긴다
+  cat > "$T/bin/chown" <<'EOF'
+#!/usr/bin/env bash
+echo "chown $*" >> "$ASB_T/calls.log"
+f=""
+for a in "$@"; do f=$a; done
+case "$f" in */history) echo "history-at-chown $(tail -n 1 "$f" 2>/dev/null || echo none)" >> "$ASB_T/calls.log" ;; esac
+exit 0
+EOF
   if ! command -v sha256sum >/dev/null 2>&1; then
     printf '#!/usr/bin/env bash\nexec shasum -a 256 "$@"\n' > "$T/bin/sha256sum"
   fi
@@ -219,7 +226,8 @@ check "배포 성공 표식" '[ "$RC" -eq 0 ] && grep -q "^DEPLOY-OK release=r01
 check "current → r01" '[ "$(current)" = r01 ]'
 check "배포 파일은 서비스 계정 소유로 맞춤" 'grep -qxF "chown -R whatap:whatap $T/app/releases/r01" "$T/calls.log"'
 check "current 링크 자체를 서비스 계정 소유로 맞춤" 'grep -qxF "chown -h whatap:whatap $T/app/current" "$T/calls.log"'
-check "배포 이력 history의 소유자는 바꾸지 않음" '! grep -E "^chown .* $T/app/history$" "$T/calls.log"'
+check "배포 이력 history 도 서비스 계정 소유로 맞춤" 'grep -qxF "chown whatap:whatap $T/app/history" "$T/calls.log"'
+check "history 소유자는 기록을 남긴 뒤 맞춤" 'grep -qx "history-at-chown r01" "$T/calls.log"'
 # 서버 디렉터리·설정은 whatap 소유가 규칙이다 (시험에서는 이 시험을 돌리는 계정 소유)
 check "APP_ROOT·conf/·config.env 가 root 소유가 아니어도 배포" '[ "$RC" -eq 0 ] && { [ "$(id -u)" = 0 ] || [ "$(owner_uid "$T/app/conf/config.env")" != 0 ]; }'
 check "배포는 unit 을 설치·활성화하지 않는다 (서버에 DevOps 가 둔다)" '[ -z "$(ls -A "$T/units")" ] && ! grep -Eq "^systemctl (enable|daemon-reload)" "$T/calls.log"'
@@ -241,9 +249,11 @@ check "재시작" 'grep -q "systemctl restart argus-slack-bot.service" "$T/calls
 # 헬스체크 실패 → 직전 release 로 자동 복귀, 실패한 release 는 지운다
 make_bundle r03
 touch "$T/state/bad-r03"
+: > "$T/calls.log"
 deploy r03
 check "실패 배포 → 종료 코드 1" '[ "$RC" -ne 0 ] && grep -q "^DEPLOY-FAILED" "$T/out.log"'
 check "자동 복귀 표식" 'grep -q "^ROLLBACK-OK release=r02" "$T/out.log"'
+check "자동 복귀도 기록을 남긴 뒤 history 를 서비스 계정 소유로" 'grep -qxF "chown whatap:whatap $T/app/history" "$T/calls.log" && grep -qx "history-at-chown r02" "$T/calls.log"'
 check "current → r02 복귀" '[ "$(current)" = r02 ]'
 check "실패한 r03 삭제" '[ ! -e "$T/app/releases/r03" ]'
 
@@ -282,6 +292,7 @@ check "release 이름 형식 검사" '[ "$RC" -ne 0 ] && [ "$(current)" = r02 ]'
 run rollback
 check "rollback → r01" '[ "$RC" -eq 0 ] && grep -q "^ROLLBACK-OK release=r01" "$T/out.log" && [ "$(current)" = r01 ]'
 check "rollback도 current 링크 자체의 소유자를 맞춤" 'grep -qxF "chown -h whatap:whatap $T/app/current" "$T/calls.log"'
+check "rollback도 기록을 남긴 뒤 history 를 서비스 계정 소유로" 'grep -qxF "chown whatap:whatap $T/app/history" "$T/calls.log" && grep -qx "history-at-chown r01" "$T/calls.log"'
 run rollback
 check "rollback 한 번 더 → r02 (직전 판)" '[ "$RC" -eq 0 ] && [ "$(current)" = r02 ]'
 touch "$T/state/bad-r01"
